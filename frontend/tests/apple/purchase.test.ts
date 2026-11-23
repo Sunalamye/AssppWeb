@@ -57,6 +57,13 @@ describe('apple/purchase', () => {
     await expect(purchaseApp(account, app)).resolves.toMatchObject({
       alreadyOwned: false,
     });
+    expect(vi.mocked(appleRequest).mock.calls[0][0].headers?.['X-Apple-Store-Front']).toBe('143441-1');
+  });
+
+  it('preserves the complete storefront returned by native authentication', async () => {
+    respondWith({ jingleDocType: 'purchaseSuccess', status: 0 });
+    await purchaseApp({ ...account, storeFront: '143441-1,29' }, app);
+    expect(vi.mocked(appleRequest).mock.calls[0][0].headers?.['X-Apple-Store-Front']).toBe('143441-1,29');
   });
 
   it('still rejects other failure types carrying the generic message', async () => {

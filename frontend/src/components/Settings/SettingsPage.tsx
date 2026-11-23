@@ -7,6 +7,7 @@ import { useToastStore } from '../../store/toast';
 import { apiGet } from '../../api/client';
 import { encryptData, decryptData } from '../../utils/crypto';
 import { countryCodeMap } from '../../apple/config';
+import { StoreProofClient } from '../../apple/storeProof';
 import type { Account } from '../../types';
 
 interface ServerInfo {
@@ -36,6 +37,7 @@ export default function SettingsPage() {
   const [country, setCountry] = useState(() => localStorage.getItem('asspp-default-country') || 'US');
   const [entity, setEntity] = useState(() => localStorage.getItem('asspp-default-entity') || 'software');
   const [serverInfo, setServerInfo] = useState<ServerInfo | null>(null);
+  const [clearingData, setClearingData] = useState(false);
 
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const [exportPassword, setExportPassword] = useState('');
@@ -315,18 +317,27 @@ export default function SettingsPage() {
           </div>
 
           <button
-            onClick={() => {
+            onClick={async () => {
+              if (clearingData) return;
               if (!confirm(t('settings.data.confirm'))) return;
-              localStorage.clear();
-              indexedDB.deleteDatabase('asspp-accounts');
-              addToast(t('settings.data.cleared'), 'success');
-              setTimeout(() => {
-                window.location.href = '/';
-              }, 1000);
+              setClearingData(true);
+              try {
+                await StoreProofClient.clearAll();
+                localStorage.clear();
+                indexedDB.deleteDatabase('asspp-accounts');
+                addToast(t('settings.data.cleared'), 'success');
+                setTimeout(() => {
+                  window.location.href = '/';
+                }, 1000);
+              } catch {
+                addToast(t('settings.data.clearFailed'), 'error');
+                setClearingData(false);
+              }
             }}
+            disabled={clearingData}
             className="min-h-11 w-full min-w-0 whitespace-normal break-words rounded-lg border border-red-300 px-4 py-2 text-center text-sm font-medium text-red-600 transition-colors hover:bg-red-50 sm:w-auto dark:border-red-800 dark:text-red-400 dark:hover:bg-red-900/30"
           >
-            {t('settings.data.button')}
+            {clearingData ? t('loading') : t('settings.data.button')}
           </button>
         </section>
 

@@ -114,7 +114,13 @@
       "retrying": "Apple이 응답하지 않습니다(HTTP {{status}}). {{seconds}}초 후 다시 시도합니다({{attempt}}/{{attempts}}번째)…",
       "cancel": "취소",
       "authFailed": "인증 실패",
-      "addSuccess": "계정이 성공적으로 추가되었습니다."
+      "addSuccess": "계정이 성공적으로 추가되었습니다.",
+      "phases": {
+        "preparing": "기기 인증을 준비하고 있습니다. 처음에는 몇 분이 걸릴 수 있습니다.",
+        "signingIn": "Apple 계정에 로그인하고 있습니다…",
+        "provisioning": "기기 인증을 완료하고 있습니다…",
+        "verifying": "인증 코드를 확인하고 있습니다…"
+      }
     },
     "detail": {
       "title": "계정 세부 정보",
@@ -279,7 +285,8 @@
       "conflictDesc": "백업에서 {{conflict}}개의 동일한 계정과 {{new}}개의 새 계정을 발견했습니다.",
       "conflictOverwrite": "로컬 덮어쓰기",
       "conflictSkip": "로컬 유지 (새 계정만 추가)",
-      "cleared": "모든 로컬 데이터가 삭제되었습니다"
+      "cleared": "모든 로컬 데이터가 삭제되었습니다",
+      "clearFailed": "로컬 데이터를 지울 수 없습니다. 다른 탭을 닫고 다시 시도하세요."
     },
     "about": {
       "title": "정보",

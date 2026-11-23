@@ -3,18 +3,15 @@ import { parsePlist } from './plist';
 
 export interface BagOutput {
   authURL: string;
+  downloadURL?: string;
   redownloadURL?: string;
   updateURL?: string;
 }
 
-export const defaultAuthURL = 'https://auth.itunes.apple.com/auth/v1/native/fast/';
+export const defaultAuthURL = 'https://auth.itunes.apple.com/auth/v1/native';
 
-const NATIVE_AUTH_HOST = 'auth.itunes.apple.com';
-
-// The bag advertises the native auth endpoint without the /fast/ sub-path that
-// the login flow requires; the no-trailing-slash variant 301s to an HTML page.
-// Legacy Store authentication also requires a trailing slash; the bare path
-// can return an empty response or an HTML error even when correctly signed.
+// Native Store authentication must retain the exact bag path and query. The
+// legacy finance endpoint alone needs its trailing slash (ipatool v2.8.1).
 export function normalizeAuthURL(rawURL: string): string {
   let url: URL;
   try {
@@ -24,20 +21,12 @@ export function normalizeAuthURL(rawURL: string): string {
   }
   if (
     /^(?:buy|p\d+-buy)\.itunes\.apple\.com$/.test(url.hostname) &&
-    /^\/WebObjects\/MZFinance\.woa\/wa\/authenticate\/*$/.test(url.pathname)
+    /^\/WebObjects\/MZFinance\.woa\/wa\/authenticate\/?$/.test(url.pathname)
   ) {
     url.pathname = '/WebObjects/MZFinance.woa/wa/authenticate/';
     return url.toString();
   }
-  if (url.hostname !== NATIVE_AUTH_HOST) {
-    return rawURL;
-  }
-  let path = url.pathname.replace(/\/+$/, '');
-  if (!path.endsWith('/fast')) {
-    path += '/fast';
-  }
-  url.pathname = `${path}/`;
-  return url.toString();
+  return rawURL;
 }
 
 // Fetches the bag via the backend proxy.
@@ -64,6 +53,7 @@ export async function fetchBag(deviceId: string): Promise<BagOutput> {
       (dict.authenticateAccount as string | undefined) ?? (urlBag?.authenticateAccount as string | undefined);
 
     const downloadURLs = {
+      downloadURL: (dict.volumeStoreDownloadProduct ?? urlBag?.volumeStoreDownloadProduct) as string | undefined,
       redownloadURL: (dict.redownloadProduct ?? urlBag?.redownloadProduct) as string | undefined,
       updateURL: (dict.updateProduct ?? urlBag?.updateProduct) as string | undefined,
     };

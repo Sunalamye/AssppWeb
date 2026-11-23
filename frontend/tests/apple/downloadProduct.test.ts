@@ -4,6 +4,14 @@ import { appleRequest } from '../../src/apple/request';
 import { buildPlist, parsePlist } from '../../src/apple/plist';
 import type { Account, Software } from '../../src/types';
 
+const proofMocks = vi.hoisted(() => ({ proof: vi.fn(), kbsync: vi.fn() }));
+vi.mock('../../src/apple/storeProof', () => ({
+  StoreProofClient: class {
+    proof = proofMocks.proof;
+    kbsync = proofMocks.kbsync;
+  },
+}));
+
 vi.mock('../../src/apple/request', () => ({ appleRequest: vi.fn() }));
 vi.mock('../../src/apple/bag', () => ({
   fetchBag: async () => ({
@@ -15,8 +23,9 @@ vi.mock('../../src/apple/bag', () => ({
 const account = {
   store: '143465',
   pod: '6',
-  deviceIdentifier: 'test-device',
-  directoryServicesIdentifier: 'test-dsid',
+  deviceIdentifier: 'aabbccddeeff',
+  directoryServicesIdentifier: '123',
+  passwordToken: 'private-token',
   cookies: [],
 } as unknown as Account;
 const app = { id: 736536022, bundleID: 'tv.danmaku.bilianime' } as Software;
@@ -35,6 +44,8 @@ const response = (body: string, status = 200) => ({
 
 beforeEach(() => {
   vi.mocked(appleRequest).mockReset();
+  proofMocks.proof.mockReset().mockResolvedValue({ 'X-Apple-AMD': 'proof', 'X-Apple-AMD-M': 'machine' });
+  proofMocks.kbsync.mockReset().mockResolvedValue('a2JzeW5j');
 });
 
 describe('download recovery boundaries', () => {

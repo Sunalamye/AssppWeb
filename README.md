@@ -6,9 +6,13 @@ A web-based tool for acquiring and installing iOS apps outside the App Store. Au
 
 ## Zero-Trust Architecture
 
-AssppWeb uses a zero-trust design where the server **never sees your Apple credentials**. All Apple API communication happens directly in your browser via WebAssembly (libcurl.js with Mbed TLS 1.3). The server only acts as a blind TCP relay (Wisp protocol) and handles IPA compilation from public CDN downloads.
+Apple account requests stay in your browser: libcurl.js and Mbed TLS encrypt Apple ID, password, verification code, cookies, and account tokens before they pass through the server's Wisp TCP relay. The browser also performs SAP signing of the exact request body and retains the authentication session for verification-code submissions.
 
-Authentication uses a fresh browser-side SAP exchange and signs the exact request body with `X-Apple-ActionSignature`. Verification-code submissions reuse the same in-memory session. The direct algorithm is ported from ApplePackage and includes no Apple executable or private framework.
+The current native authentication flow additionally needs Store AMD device proofs. A small Go helper inside the application container produces these proofs using the pinned [ipatool implementation](https://github.com/majd/ipatool/tree/3b02b4c55576562f2a55284cda9db9a4411d3067) and its verified Apple runtime assets. Its API accepts only device identifiers, opaque machine provisioning state, fixed Apple provisioning responses, and a numeric DSID for download key synchronization. It never accepts Apple passwords, verification codes, account cookies, account tokens, or login request bodies. The account-associated Apple provisioning request still runs in the browser through Wisp.
+
+Completed machine state is stored in browser IndexedDB and returned to the helper only when needed. The server retains unfinished provisioning sessions in memory for at most two minutes and does not persist completed machine state. This lets authentication survive Cloudflare Container restarts without moving account credentials to the server. See [proof-helper/README.md](proof-helper/README.md) for the API and trust boundary.
+
+Native authentication handles Apple's `RP` and `SP` device-provisioning responses before ordinary HTTP retries, including responses with an empty body. Download requests use fresh URL-bound AMD proofs, DSID key synchronization, the account token, the complete storefront, and an explicit iOS version. The server continues to download the resulting IPA from Apple's CDN and inject its supplied SINF signatures and metadata.
 
 > **⚠️ Important Security Notice:** There are no official Asspp Web instances. Use any public instance at your own risk. While the backend cannot read your encrypted traffic, a malicious host could serve a modified frontend to capture your credentials before encryption. Therefore, **do not blindly trust public instances**. We strongly recommend self-hosting your own instance or using one provided by a trusted partner. Always verify the SSL certificate and ensure you are connecting to a secure, authentic endpoint.
 
@@ -26,9 +30,15 @@ Open <http://localhost:8080>. The local override builds the source and binds onl
 
 ### Deploy to Cloudflare
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Lakr233/AssppWeb&apiTokenTmpl=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22write%22%7D%2C%7B%22key%22%3A%22containers%22%2C%22type%22%3A%22write%22%7D%2C%7B%22key%22%3A%22cloudchamber%22%2C%22type%22%3A%22write%22%7D%5D&apiTokenName=AssppWeb%20Deploy)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Sunalamye/AssppWeb&apiTokenTmpl=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22write%22%7D%2C%7B%22key%22%3A%22containers%22%2C%22type%22%3A%22write%22%7D%2C%7B%22key%22%3A%22cloudchamber%22%2C%22type%22%3A%22write%22%7D%5D&apiTokenName=AssppWeb%20Deploy)
 
-This uses Cloudflare Workers + Containers with the published image `ghcr.io/lakr233/assppweb:latest`.
+This fork uses Cloudflare Workers + Containers and builds the repository's `./Dockerfile`, as configured in `wrangler.jsonc`. The Worker forwards HTTP and WebSocket traffic to the container; Node.js and the native proof helper run together inside that container.
+
+For an existing Workers Builds connection to this repository's `main` branch, pushing a commit triggers the configured build and deployment. No new bindings or secrets are needed for native authentication. The Docker build downloads and verifies public proof-runtime assets in advance, so an ordinary login does not have to download them. The first uncached build can take longer.
+
+After deployment, `/api/settings` reports `appleAuthProtocol: "native-store-amd-v1"`. `/api/store-proof/health` reports `ready` after the native helper has initialized. Both endpoints use the existing access protection when configured.
+
+The upstream `ghcr.io/lakr233/assppweb:latest` image is separate from this fork's source build and does not automatically include these changes.
 
 Requirements:
 

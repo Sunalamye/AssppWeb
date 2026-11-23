@@ -5,6 +5,17 @@ import { buildPlist, parsePlist } from '../../src/apple/plist';
 import { appleRequest } from '../../src/apple/request';
 import { connectSAP } from '../../src/apple/sap';
 
+vi.mock('../../src/apple/storeProof', () => ({
+  StoreProofClient: class {
+    async bootstrap() {
+      return { mode: 'store', headers: { 'X-Apple-AMD': 'initial-proof', 'X-Apple-AMD-M': 'machine-proof' } };
+    }
+    async proof() {
+      return { 'X-Apple-AMD': 'fresh-proof', 'X-Apple-AMD-M': 'machine-proof' };
+    }
+  },
+}));
+
 vi.mock('../../src/apple/request', () => ({ appleRequest: vi.fn() }));
 vi.mock('../../src/apple/sap', () => ({ connectSAP: vi.fn() }));
 vi.mock('../../src/apple/bag', async (original) => ({

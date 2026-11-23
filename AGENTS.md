@@ -12,58 +12,31 @@
 - `backend/` — Node.js/Express server (TypeScript, ESM)
 - `frontend/` — React SPA (TypeScript, Vite, Tailwind CSS)
 - `e2e/` — Playwright E2E tests (pnpm)
-- `references/ApplePackage/` — Swift reference implementation (source of truth)
-- Multi-stage Docker build (single container serves both)
+- `proof-helper/` — loopback-only Go adapter around pinned ipatool native device-proof APIs
+- `references/ApplePackage/` — historical Swift protocol reference, when available
+- Multi-stage Docker build (one container serves the frontend, backend, and proof helper)
 
-## Architecture — Zero-Trust
+## Architecture — Browser Account Credential Boundary
 
-The server is a blind TCP proxy. It NEVER sees Apple credentials.
+Apple account passwords, verification codes, account cookies, password tokens, exact login bodies, and SAP signer state remain in the browser. Account API TLS terminates inside libcurl.js WASM (Mbed TLS); the Wisp server relays encrypted TCP without decrypting it.
 
-```
-┌─ Browser (Client) ─────────────────────────────────┐
-│  Credentials (IndexedDB): email, password, cookies, │
-│    passwordToken, DSID, deviceIdentifier, pod       │
-│                                                      │
-│  Apple Protocol (libcurl.js WASM + Mbed TLS 1.3):   │
-│    1. Bag fetch → backend proxy → resolve auth URL   │
-│       (fallback to default auth endpoint if missing)  │
-│    2. Authenticate → get token, cookies, pod         │
-│    3. Purchase → acquire license                     │
-│    4. Download info → get CDN URL + SINFs + metadata │
-│    5. Version listing/lookup                         │
-│                                                      │
-│  TLS 1.3 encrypted via Wisp protocol over WebSocket  │
-└──────────────────────┬───────────────────────────────┘
-                       │ Wisp-multiplexed TCP (server cannot read)
-┌─ Server (Wisp Proxy) ┴──────────────────────────────┐
-│  Wisp server (@mercuryworkshop/wisp-js) on /wisp/    │
-│  → multiplexed TCP relay (blind tunnel, no decrypt)  │
-│                                                      │
-│  Bag proxy: GET /api/bag?guid=<id>                   │
-│    - Fetches init.itunes.apple.com/bag.xml via HTTPS │
-│    - Returns public Apple service URLs (no creds)    │
-│                                                      │
-│  After client obtains download info:                 │
-│    Client POSTs: { downloadURL, sinfs, metadata }    │
-│    - downloadURL = Apple CDN (public, no auth)       │
-│    - sinfs = DRM signatures (base64)                 │
-│    - iTunesMetadata = app metadata plist (base64)    │
-│                                                      │
-│  Server downloads IPA from CDN, injects SINFs +      │
-│  iTunesMetadata, stores compiled IPA, serves via     │
-│  public install URL (itms-services manifest)         │
-└──────────────────────────────────────────────────────┘
-```
+| Component           | Responsibility                                                                                             | Permitted server-visible data                                                      |
+| ------------------- | ---------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| Browser             | SAP signing, native authentication, account-associated provisioning finish, purchase and download requests | No account credentials sent to backend HTTP APIs                                   |
+| Wisp relay          | Approved Apple HTTPS TCP connections                                                                       | Encrypted traffic and connection metadata                                          |
+| Bag proxy           | Fetch public Configurator service URLs                                                                     | Device GUID and public bag data                                                    |
+| Device-proof helper | Native machine bootstrap, Store AMD, provisioning start/finish, KBSync                                     | Device GUID, opaque machine state, provisioning challenges/responses, numeric DSID |
+| IPA compiler        | Download CDN package and inject SINF/iTunesMetadata                                                        | Download URL, SINF signatures, metadata                                            |
 
-**Key invariant**: The server NEVER sees Apple credentials. All Apple TLS terminates at the browser via libcurl.js WASM (Mbed TLS 1.3). The server only receives public CDN URLs and non-secret metadata for IPA compilation. The bag proxy (`/api/bag`) only returns public Apple service URLs — no credentials pass through it.
+The helper binds only to `127.0.0.1:8081`; Express exposes its typed interface behind the existing access check. Reject unlisted fields and endpoints. Never add Apple ID, password, account cookies, account tokens, SAP state, or arbitrary login request bodies to its contract. Never log opaque state, challenges, proof values, or native error details.
+
+Completed machine state belongs to the browser and is stored in the separate `asspp-store-proof` IndexedDB database. Helper requests round-trip that state; the server must not persist it or maintain a global device-to-state map. Unfinished native provisioning contexts are limited to two, expire after two minutes, and use single-use random handles. The browser performs Apple's account-associated provisioning finish request over Wisp so its account cookies never reach the helper.
 
 ## Reference Implementation
 
-The Swift reference at `references/ApplePackage/` is the source of truth for Apple protocol behavior:
+Native authentication and Store AMD/download behavior follow [`majd/ipatool` at `3b02b4c55576562f2a55284cda9db9a4411d3067`](https://github.com/majd/ipatool/tree/3b02b4c55576562f2a55284cda9db9a4411d3067). The Docker build pins that revision and builds the helper inside the upstream Go module to use its internal APIs. Preserve the upstream MIT license. Consult [proof-helper/README.md](proof-helper/README.md) before changing this boundary or updating the pin.
 
-- Field mappings (iTunes API → Software type) use Swift `CodingKeys`
-- Authentication flow, bag endpoint, pod routing, error codes
-- Always consult the reference when making protocol changes
+The historical Swift reference at `references/ApplePackage/`, when present, remains useful for iTunes field mappings and the browser SAP implementation. Consult current upstream source before making protocol changes; do not assume the older SAP-only login body is sufficient for native authentication.
 
 ### iTunes API Field Mapping
 
@@ -143,9 +116,10 @@ The backend proxies the bag endpoint via `GET /api/bag?guid=<deviceId>` using No
 - IndexedDB for credential storage (via `idb`)
 - `libcurl.js` (WASM) for browser-side TLS 1.3 via Mbed TLS — connects through Wisp protocol
 - `appleRequest()` in `frontend/src/apple/request.ts` wraps `libcurl.fetch` for all Apple API calls and forces HTTP/1.1 (`_libcurl_http_version: 1.1`)
-- Bag endpoint (`frontend/src/apple/bag.ts`) uses backend proxy (`/api/bag`) and falls back to `https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate` when `authenticateAccount` is missing or bag fetch fails
-- Authentication (`frontend/src/apple/authenticate.ts`) resolves bag endpoint, then sets `guid` via URL query manipulation to avoid duplicate/malformed query parameters. Transient responses (204, 404, 429, 5xx) are replayed up to three attempts, 10s then 20s apart, honoring a `Retry-After` of up to 30s (ipatool parity); the optional `onRetry` callback lets the sign-in screens show the wait
+- Bag endpoint (`frontend/src/apple/bag.ts`) uses backend proxy (`/api/bag`) with Configurator 2.21 and `ix=6`. It falls back to `https://auth.itunes.apple.com/auth/v1/native` when `authenticateAccount` is missing or the bag fetch fails; native URLs are normalized without forcing `/fast/`.
+- Authentication (`frontend/src/apple/authenticate.ts`) uses the native body and fresh URL-bound Store AMD proofs, handles `RP`/`SP` provisioning before HTTP retries, and retains its session for verification codes. Native authentication uses the endpoint without a GUID query. Transient empty responses (204, 403, 404, 429, 5xx) are retried at most three times with bounded backoff; populated account errors are surfaced immediately. The optional phase/retry callbacks drive sign-in progress.
 - SAP signing (`frontend/src/apple/sap/`) is a direct browser implementation ported from ApplePackage. Fresh setup and `X-Apple-ActionSignature` are mandatory for authentication. Sign the exact UTF-8 body on every retry/redirect; retain the `Authenticator` across verification-code submissions. Never send credentials or SAP session material to backend HTTP endpoints, persist signer state, or fall back to unsigned authentication.
+- Store device state (`frontend/src/apple/storeProof.ts`) is opaque and browser-owned. Serialize operations for each device, including across tabs. The Settings clear-data action must remove both account and device-proof databases.
 - Plist build/parse (`frontend/src/apple/plist.ts`) uses native XML builder and browser-native `DOMParser`
 - Cookie helper (`frontend/src/apple/cookies.ts`) — `extractAndMergeCookies(rawHeaders, existingCookies)` replaces the repeated extract-and-merge pattern across all Apple protocol files
 
@@ -188,7 +162,7 @@ The backend proxies the bag endpoint via `GET /api/bag?guid=<deviceId>` using No
 
 ### Account Hash Is Public
 
-`accountHash` is a SHA-256 of the account email. It is treated as **public, non-secret data** — it identifies which account owns a download but does not grant any privileged access. No authentication is bound to it. This is by design: the server is a blind proxy and does not manage user sessions.
+`accountHash` is a SHA-256 of the account email. It is treated as **public, non-secret data** — it identifies which account owns a download but does not grant any privileged access. No authentication is bound to it. The server does not manage Apple account sessions.
 
 ### Trusted Sources
 
@@ -248,7 +222,7 @@ E2E tests import from `./fixtures` instead of `@playwright/test`.
 
 WebSocket proxy tests use `location.host` to derive URLs dynamically, so they work both locally (`localhost:8080`) and in Docker (`asspp:8080`).
 
-Real-account Docker verification (2026-02-22): authentication succeeds through Wisp, and backend logs contain only connection/stream metadata (no Apple credentials, password tokens, or cookies).
+Historical real-account Docker verification (2026-02-22): authentication succeeded through Wisp, and backend logs contained only connection/stream metadata (no Apple credentials, password tokens, or cookies). That check predates native Store AMD authentication and does not validate the current account flow. Native runtime smoke tests use synthetic identifiers; actual account acceptance must be verified in the user's browser.
 
 E2E tests cover:
 
@@ -269,7 +243,7 @@ Test credentials are stored in environment variables (`TEST_EMAIL`, `TEST_PASSWO
 docker compose up --build -d   # Builds and runs on port 8080
 ```
 
-Single container serves both the Express backend and the Vite-built React SPA. SPA routes are handled by serving `index.html` for all non-API paths.
+A single container serves Express and the Vite-built React SPA and runs the loopback native proof helper. `container/start.mjs` supervises both processes. The Docker build prepares verified public runtime assets; it must not provision a device or use an Apple account at build time. SPA routes are handled by serving `index.html` for all non-API paths. The existing Cloudflare configuration builds `./Dockerfile`, so a configured Workers Builds connection deploys source updates from `main`.
 
 ### Docker E2E Testing
 

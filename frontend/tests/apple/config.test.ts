@@ -15,7 +15,7 @@ import {
 describe('apple/config', () => {
   describe('userAgent', () => {
     it('should be the Configurator user agent string', () => {
-      expect(userAgent).toContain('Configurator/2.17');
+      expect(userAgent).toContain('Configurator/2.21');
       expect(userAgent).toContain('Macintosh');
       expect(userAgent).toContain('AppleWebKit');
     });

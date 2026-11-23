@@ -5,6 +5,17 @@ import { authenticate } from '../../src/apple/authenticate';
 import { appleRequest } from '../../src/apple/request';
 import { fetchBag } from '../../src/apple/bag';
 
+vi.mock('../../src/apple/storeProof', () => ({
+  StoreProofClient: class {
+    async bootstrap() {
+      return { mode: 'store', headers: { 'X-Apple-AMD': 'initial-proof', 'X-Apple-AMD-M': 'machine-proof' } };
+    }
+    async proof() {
+      return { 'X-Apple-AMD': 'fresh-proof', 'X-Apple-AMD-M': 'machine-proof' };
+    }
+  },
+}));
+
 vi.mock('../../src/apple/sap', () => ({
   connectSAP: vi.fn(async () => ({ sign: async () => Uint8Array.of(1, 2, 3) })),
 }));

@@ -34,6 +34,8 @@ export interface Account {
   password: string;
   appleId: string;
   store: string;
+  /** Complete Apple storefront header, including its routing/version suffix. */
+  storeFront?: string;
   firstName: string;
   lastName: string;
   passwordToken: string;

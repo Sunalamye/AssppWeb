@@ -26,7 +26,7 @@ describe('apple/bag', () => {
     expect(result.authURL).toBe('https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate/');
   });
 
-  it('normalizes a native auth endpoint at the plist root to the /fast/ path', async () => {
+  it('preserves a native auth endpoint at the plist root', async () => {
     const xml = buildPlist({
       authenticateAccount: 'https://auth.itunes.apple.com/auth/v1/native',
     });
@@ -40,7 +40,7 @@ describe('apple/bag', () => {
 
     const result = await fetchBag('aabbccddeeff');
 
-    expect(result.authURL).toBe('https://auth.itunes.apple.com/auth/v1/native/fast/');
+    expect(result.authURL).toBe('https://auth.itunes.apple.com/auth/v1/native');
   });
 
   it('falls back when authenticateAccount is missing', async () => {
@@ -81,15 +81,15 @@ describe('apple/bag', () => {
   });
 
   describe('normalizeAuthURL', () => {
-    it('appends /fast/ to a bare native auth endpoint', () => {
+    it('preserves a bare native authentication endpoint', () => {
       expect(normalizeAuthURL('https://auth.itunes.apple.com/auth/v1/native')).toBe(
-        'https://auth.itunes.apple.com/auth/v1/native/fast/',
+        'https://auth.itunes.apple.com/auth/v1/native',
       );
     });
 
-    it('adds the trailing slash when /fast is already present', () => {
+    it('preserves a native fast endpoint exactly when advertised', () => {
       expect(normalizeAuthURL('https://auth.itunes.apple.com/auth/v1/native/fast')).toBe(
-        'https://auth.itunes.apple.com/auth/v1/native/fast/',
+        'https://auth.itunes.apple.com/auth/v1/native/fast',
       );
     });
 

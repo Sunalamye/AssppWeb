@@ -114,7 +114,13 @@
       "retrying": "Apple 暂未响应（HTTP {{status}}），{{seconds}} 秒后重试（第 {{attempt}}/{{attempts}} 次）…",
       "cancel": "取消",
       "authFailed": "认证失败",
-      "addSuccess": "账号添加成功。"
+      "addSuccess": "账号添加成功。",
+      "phases": {
+        "preparing": "正在准备设备验证，首次使用可能需要几分钟。",
+        "signingIn": "正在登录 Apple 账户…",
+        "provisioning": "正在完成设备验证…",
+        "verifying": "正在确认验证码…"
+      }
     },
     "detail": {
       "title": "账号详情",
@@ -279,7 +285,8 @@
       "conflictDesc": "在备份中发现 {{conflict}} 个相同的账号以及 {{new}} 个新账号。",
       "conflictOverwrite": "覆盖本地",
       "conflictSkip": "保留本地 (仅添加新账号)",
-      "cleared": "所有本地数据已清空"
+      "cleared": "所有本地数据已清空",
+      "clearFailed": "无法清除本地数据。请关闭其他标签页后重试。"
     },
     "about": {
       "title": "关于",

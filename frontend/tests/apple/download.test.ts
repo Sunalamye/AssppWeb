@@ -7,6 +7,14 @@ import { fetchBag } from '../../src/apple/bag';
 import { buildPlist, parsePlist } from '../../src/apple/plist';
 import type { Account, Software } from '../../src/types';
 
+const proofMocks = vi.hoisted(() => ({ proof: vi.fn(), kbsync: vi.fn() }));
+vi.mock('../../src/apple/storeProof', () => ({
+  StoreProofClient: class {
+    proof = proofMocks.proof;
+    kbsync = proofMocks.kbsync;
+  },
+}));
+
 vi.mock('../../src/apple/request', () => ({ appleRequest: vi.fn() }));
 vi.mock('../../src/apple/bag', () => ({ fetchBag: vi.fn() }));
 
@@ -60,6 +68,8 @@ function catalog(version: unknown = 891730218, bundleId = app.bundleID) {
 describe('Apple download and version recovery', () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    proofMocks.proof.mockResolvedValue({ 'X-Apple-AMD': 'proof', 'X-Apple-AMD-M': 'machine' });
+    proofMocks.kbsync.mockResolvedValue('a2JzeW5j');
     vi.mocked(fetchBag).mockResolvedValue({
       authURL: '',
       updateURL: 'https://downloaddispatch.itunes.apple.com/up/updateProduct',

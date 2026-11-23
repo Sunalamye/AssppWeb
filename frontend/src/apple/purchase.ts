@@ -63,7 +63,7 @@ async function purchaseWithParams(account: Account, app: Software, pricingParame
     'Content-Type': 'application/x-apple-plist',
     'iCloud-DSID': account.directoryServicesIdentifier,
     'X-Dsid': account.directoryServicesIdentifier,
-    'X-Apple-Store-Front': `${account.store}-1`,
+    'X-Apple-Store-Front': account.storeFront || `${account.store}-1`,
     'X-Token': account.passwordToken,
   };
 

@@ -3,12 +3,11 @@ import https from 'https';
 import { BAG_TIMEOUT_MS, BAG_MAX_BYTES } from '../config.js';
 
 const router = Router();
-const userAgent = 'Configurator/2.17 (Macintosh; OS X 15.2; 24C5089c) AppleWebKit/0620.1.16.11.6';
+const userAgent = 'Configurator/2.21 (Macintosh; OS X 27.0.1; 26A434) AppleWebKit/0625.2.5.11.6';
 
 // Proxy for Apple's bag endpoint.
 // The bag response is public data (Apple service URLs, no credentials).
-// Proxied server-side because init.itunes.apple.com requires TLS 1.3,
-// which node-forge (browser-side TLS) does not support.
+// The public service directory is fetched without Apple account credentials.
 router.get('/bag', async (req: Request, res: Response) => {
   const guid = req.query.guid as string | undefined;
   if (!guid) {
@@ -22,7 +21,7 @@ router.get('/bag', async (req: Request, res: Response) => {
     return;
   }
 
-  const url = `https://init.itunes.apple.com/bag.xml?guid=${encodeURIComponent(guid)}`;
+  const url = `https://init.itunes.apple.com/bag.xml?ix=6&guid=${encodeURIComponent(guid)}`;
 
   try {
     const body = await new Promise<string>((resolve, reject) => {

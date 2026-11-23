@@ -8,7 +8,7 @@ import { useToastStore } from '../../store/toast';
 import { Authenticator, AuthenticationError } from '../../apple/authenticate';
 import { getErrorMessage } from '../../utils/error';
 import { storeIdToCountry } from '../../apple/config';
-import type { AuthRetry } from '../../apple/authenticate';
+import type { AuthPhase, AuthRetry } from '../../apple/authenticate';
 
 export default function AccountDetail() {
   const { email } = useParams<{ email: string }>();
@@ -20,6 +20,7 @@ export default function AccountDetail() {
   const [showDelete, setShowDelete] = useState(false);
   const [reauthing, setReauthing] = useState(false);
   const [reauthRetry, setReauthRetry] = useState<AuthRetry | null>(null);
+  const [reauthPhase, setReauthPhase] = useState<AuthPhase | null>(null);
   const [reauthCode, setReauthCode] = useState('');
   const [needsCode, setNeedsCode] = useState(false);
   const authenticator = useRef<Authenticator | null>(null);
@@ -64,6 +65,7 @@ export default function AccountDetail() {
         account.password,
         needsCode && reauthCode ? reauthCode : undefined,
         setReauthRetry,
+        setReauthPhase,
       );
       await updateAccount(updated);
       setNeedsCode(false);
@@ -74,10 +76,14 @@ export default function AccountDetail() {
         setNeedsCode(true);
         addToast(err.message, 'error');
       } else {
+        setNeedsCode(false);
+        setReauthCode('');
+        authenticator.current = null;
         addToast(getErrorMessage(err, t('accounts.detail.reauthFailed')), 'error');
       }
     } finally {
       setReauthRetry(null);
+      setReauthPhase(null);
       setReauthing(false);
     }
   }
@@ -140,6 +146,11 @@ export default function AccountDetail() {
           </section>
         )}
 
+        {reauthing && reauthPhase && !reauthRetry && (
+          <p role="status" className="text-sm text-gray-600 dark:text-gray-400">
+            {t(`accounts.addForm.phases.${reauthPhase}`)}
+          </p>
+        )}
         {reauthRetry && (
           <p className="text-sm text-gray-600 dark:text-gray-400">
             {t('accounts.addForm.retrying', {

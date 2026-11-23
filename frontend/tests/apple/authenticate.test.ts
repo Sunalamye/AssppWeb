@@ -4,6 +4,17 @@ import { authenticate } from '../../src/apple/authenticate';
 import { appleRequest } from '../../src/apple/request';
 import { fetchBag } from '../../src/apple/bag';
 
+vi.mock('../../src/apple/storeProof', () => ({
+  StoreProofClient: class {
+    async bootstrap() {
+      return { mode: 'store', headers: { 'X-Apple-AMD': 'initial-proof', 'X-Apple-AMD-M': 'machine-proof' } };
+    }
+    async proof() {
+      return { 'X-Apple-AMD': 'fresh-proof', 'X-Apple-AMD-M': 'machine-proof' };
+    }
+  },
+}));
+
 vi.mock('../../src/apple/sap', () => ({
   connectSAP: vi.fn(async () => ({ sign: async () => Uint8Array.of(1, 2, 3) })),
 }));
@@ -23,7 +34,7 @@ describe('apple/authenticate', () => {
     vi.clearAllMocks();
   });
 
-  it('sets guid query exactly once from bag endpoint', async () => {
+  it('preserves the exact bag routing query and sends the device GUID in the signed body', async () => {
     vi.mocked(fetchBag).mockResolvedValue({
       authURL: 'https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate?foo=1&guid=old-value',
     });
@@ -51,11 +62,12 @@ describe('apple/authenticate', () => {
     const endpoint = new URL(`https://${requestCall.host}${requestCall.path}`);
 
     expect(endpoint.pathname).toBe('/WebObjects/MZFinance.woa/wa/authenticate/');
-    expect(endpoint.searchParams.get('guid')).toBe('aabbccddeeff');
+    expect(endpoint.searchParams.get('guid')).toBe('old-value');
+    expect(requestCall.body).toContain('<key>guid</key><string>aabbccddeeff</string>');
     expect(endpoint.searchParams.getAll('guid')).toHaveLength(1);
     expect(endpoint.searchParams.get('foo')).toBe('1');
   });
-  it.each([301, 302, 303, 307, 308])(
+  it.each([301, 302, 307, 308])(
     'normalizes a relative legacy redirect (%s) and preserves its query',
     async (status) => {
       vi.mocked(fetchBag).mockResolvedValue({

@@ -114,7 +114,13 @@
       "retrying": "Apple did not respond (HTTP {{status}}). Retrying in {{seconds}}s (attempt {{attempt}} of {{attempts}})…",
       "cancel": "Cancel",
       "authFailed": "Authentication failed",
-      "addSuccess": "Account added successfully."
+      "addSuccess": "Account added successfully.",
+      "phases": {
+        "preparing": "Preparing device verification. First use may take a few minutes.",
+        "signingIn": "Signing in to your Apple Account…",
+        "provisioning": "Completing device verification…",
+        "verifying": "Checking the verification code…"
+      }
     },
     "detail": {
       "title": "Account Details",
@@ -279,7 +285,8 @@
       "conflictDesc": "Found {{conflict}} identical accounts and {{new}} new accounts in the backup.",
       "conflictOverwrite": "Overwrite Local",
       "conflictSkip": "Keep Local (Add New Only)",
-      "cleared": "All local data has been cleared"
+      "cleared": "All local data has been cleared",
+      "clearFailed": "Local data could not be cleared. Close other tabs and try again."
     },
     "about": {
       "title": "About",

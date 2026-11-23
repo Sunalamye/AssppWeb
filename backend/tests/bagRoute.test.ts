@@ -38,8 +38,9 @@ describe('Bag Route', () => {
     expect(res.text).toContain('<plist');
     expect(getSpy).toHaveBeenCalledTimes(1);
 
-    const [, options] = getSpy.mock.calls[0];
-    expect(options.headers['User-Agent']).toContain('Configurator/2.17');
+    const [url, options] = getSpy.mock.calls[0];
+    expect(String(url)).toBe('https://init.itunes.apple.com/bag.xml?ix=6&guid=aabbccddeeff');
+    expect(options.headers['User-Agent']).toContain('Configurator/2.21');
     expect(options.headers.Accept).toBe('application/xml');
   });
 

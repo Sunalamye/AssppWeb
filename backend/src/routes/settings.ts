@@ -9,6 +9,7 @@ router.get('/settings', (_req: Request, res: Response) => {
     uptime: Math.floor((Date.now() - startedAt) / 1000),
     buildCommit: config.buildCommit,
     buildDate: config.buildDate,
+    appleAuthProtocol: 'native-store-amd-v1',
     port: config.port,
     dataDir: config.dataDir,
     publicBaseUrl: config.publicBaseUrl,

@@ -8,7 +8,7 @@ import { useToastStore } from '../../store/toast';
 import { Authenticator, AuthenticationError } from '../../apple/authenticate';
 import { getErrorMessage } from '../../utils/error';
 import { generateDeviceId } from '../../apple/config';
-import type { AuthRetry } from '../../apple/authenticate';
+import type { AuthPhase, AuthRetry } from '../../apple/authenticate';
 
 export default function AddAccountForm() {
   const navigate = useNavigate();
@@ -24,6 +24,7 @@ export default function AddAccountForm() {
   const authenticator = useRef<Authenticator | null>(null);
   const [loading, setLoading] = useState(false);
   const [retry, setRetry] = useState<AuthRetry | null>(null);
+  const [phase, setPhase] = useState<AuthPhase | null>(null);
   const inputClassName =
     'block min-h-11 w-full min-w-0 max-w-full rounded-xl border-0 bg-gray-100 px-3 py-2 text-base text-gray-900 focus:ring-2 focus:ring-blue-500/40 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-gray-800 dark:text-white';
 
@@ -41,6 +42,7 @@ export default function AddAccountForm() {
         password,
         needsCode && code ? code : undefined,
         setRetry,
+        setPhase,
       );
       await addAccount(account);
       addToast(t('accounts.addForm.addSuccess'), 'success');
@@ -50,10 +52,14 @@ export default function AddAccountForm() {
         setNeedsCode(true);
         addToast(err.message, 'error');
       } else {
+        setNeedsCode(false);
+        setCode('');
+        authenticator.current = null;
         addToast(getErrorMessage(err, t('accounts.addForm.authFailed')), 'error');
       }
     } finally {
       setRetry(null);
+      setPhase(null);
       setLoading(false);
     }
   }
@@ -72,7 +78,12 @@ export default function AddAccountForm() {
                 type="text"
                 required
                 value={email}
-                onChange={(e) => setEmail(e.target.value)}
+                onChange={(e) => {
+                  setEmail(e.target.value);
+                  setNeedsCode(false);
+                  setCode('');
+                  authenticator.current = null;
+                }}
                 disabled={loading}
                 placeholder={t('accounts.addForm.emailPlaceholder')}
                 className={inputClassName}
@@ -88,7 +99,12 @@ export default function AddAccountForm() {
                 type="password"
                 required
                 value={password}
-                onChange={(e) => setPassword(e.target.value)}
+                onChange={(e) => {
+                  setPassword(e.target.value);
+                  setNeedsCode(false);
+                  setCode('');
+                  authenticator.current = null;
+                }}
                 disabled={loading}
                 className={inputClassName}
               />
@@ -129,6 +145,7 @@ export default function AddAccountForm() {
                   id="code"
                   type="text"
                   inputMode="numeric"
+                  required
                   pattern="[0-9]*"
                   maxLength={6}
                   value={code}
@@ -161,6 +178,11 @@ export default function AddAccountForm() {
               {t('accounts.addForm.cancel')}
             </button>
           </div>
+          {loading && phase && !retry && (
+            <p role="status" className="text-sm text-gray-600 dark:text-gray-400">
+              {t(`accounts.addForm.phases.${phase}`)}
+            </p>
+          )}
           {retry && (
             <p className="text-sm text-gray-600 dark:text-gray-400">
               {t('accounts.addForm.retrying', {
