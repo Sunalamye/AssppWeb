@@ -1,5 +1,7 @@
 import { authHeaders } from '../api/client';
 import { parsePlist } from './plist';
+import { errorDiagnosticDetails } from '../utils/diagnostics';
+import type { DiagnosticFlow } from '../utils/diagnostics';
 
 export interface BagOutput {
   authURL: string;
@@ -32,14 +34,21 @@ export function normalizeAuthURL(rawURL: string): string {
 // Fetches the bag via the backend proxy.
 // The backend fetches it using Node.js native HTTPS.
 // The bag response is public data (Apple service URLs, no credentials).
-export async function fetchBag(deviceId: string): Promise<BagOutput> {
+export async function fetchBag(deviceId: string, flow?: DiagnosticFlow): Promise<BagOutput> {
+  const started = Date.now();
+  flow?.log('bag', 'start', { endpoint: 'bag' });
   try {
     const resp = await fetch(`/api/bag?guid=${encodeURIComponent(deviceId)}`, {
-      headers: authHeaders(),
+      headers: { ...authHeaders(), ...(flow ? { 'X-Asspp-Flow-Id': flow.id } : {}) },
     });
     if (!resp.ok) {
-      const err = await resp.json().catch(() => ({ error: resp.statusText }));
-      console.warn(`[Bag] Proxy request failed, using default auth endpoint: ${err.error || `HTTP ${resp.status}`}`);
+      flow?.log('bag', 'failure', {
+        endpoint: 'bag',
+        httpStatus: resp.status,
+        reason: 'http_error',
+        durationMs: Date.now() - started,
+      });
+      flow?.log('bag', 'transition', { endpoint: 'native_auth', reason: 'fallback' });
       return { authURL: defaultAuthURL };
     }
 
@@ -59,17 +68,19 @@ export async function fetchBag(deviceId: string): Promise<BagOutput> {
     };
 
     if (!authURL) {
-      console.warn('[Bag] authenticateAccount URL not found in bag, using default auth endpoint');
+      flow?.log('bag', 'transition', { endpoint: 'native_auth', reason: 'fallback', httpStatus: resp.status });
       return { authURL: defaultAuthURL, ...downloadURLs };
     }
 
+    flow?.log('bag', 'success', { endpoint: 'bag', httpStatus: resp.status, durationMs: Date.now() - started });
     return { authURL: normalizeAuthURL(authURL), ...downloadURLs };
   } catch (error) {
-    console.warn(
-      `[Bag] Failed to fetch/parse bag, using default auth endpoint: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
+    flow?.log('bag', 'failure', {
+      ...errorDiagnosticDetails(error),
+      endpoint: 'bag',
+      durationMs: Date.now() - started,
+    });
+    flow?.log('bag', 'transition', { endpoint: 'native_auth', reason: 'fallback' });
     return { authURL: defaultAuthURL };
   }
 }

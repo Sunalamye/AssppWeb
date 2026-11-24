@@ -184,6 +184,17 @@ The settings endpoint (`/api/settings`) must never reflect request headers (`x-f
 - Express error middleware for centralized handling
 - Type-safe error responses
 
+### State Transitions and Diagnostics
+
+See `docs/observability.md` for the reviewed state machines, recovery boundaries, and log-reading workflow.
+
+- Carry one `DiagnosticFlow` through a user action. Record start, protocol transitions/retries, and the terminal success/failure/cancellation using the typed diagnostic helpers.
+- Browser Apple HTTP status and safe protocol classifications reach Cloudflare through `POST /api/diagnostics`. Never send full request/response objects, arbitrary messages/URLs, credentials, or opaque proof material to this route or any logger.
+- Keep frontend/backend diagnostic allowlists synchronized. Backend events distinguish browser reports from server/helper observations; an HTTP 200 is not application-level success.
+- Preserve same-account and per-device operation locks, reset exclusivity, and task-generation ownership. Test stale-response and cancellation races when changing these paths.
+- Keep Cloudflare invocation logs enabled with query-string redaction. Wisp access tokens must be removed from URLs before library logging.
+- Do not automatically accept App Store terms or replay an uncertain purchase/enqueue. Surface the actionable state and its flow ID.
+
 ### Apple Protocol Error Codes
 
 - `2034` / `2042`: Token expired — re-authentication required

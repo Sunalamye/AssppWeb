@@ -8,6 +8,7 @@ import Spinner from '../common/Spinner';
 import { isProductPreviewEnabled, previewProductAccounts, previewProductApp } from './productPreview';
 import { useAccounts } from '../../hooks/useAccounts';
 import { useDownloadAction } from '../../hooks/useDownloadAction';
+import { useActionGuard } from '../../hooks/useActionGuard';
 import { useToastStore } from '../../store/toast';
 import { lookupApp } from '../../api/search';
 import { storeIdToCountry } from '../../apple/config';
@@ -20,6 +21,7 @@ export default function ProductDetail() {
   const { t } = useTranslation();
   const addToast = useToastStore((state) => state.addToast);
   const { startDownload, acquireLicense, toastDownloadError, toastLicenseError } = useDownloadAction();
+  const actionGuard = useActionGuard();
 
   const previewEnabled = isProductPreviewEnabled(location.search);
   const productAccounts = previewEnabled ? previewProductAccounts : accounts;
@@ -81,6 +83,7 @@ export default function ProductDetail() {
 
   async function handlePurchase() {
     if (!account || !app) return;
+    if (!actionGuard.begin('license')) return;
     setLoadingAction('purchase');
     try {
       if (previewEnabled) {
@@ -92,12 +95,14 @@ export default function ProductDetail() {
     } catch (e) {
       toastLicenseError(account, app, e);
     } finally {
+      actionGuard.end();
       setLoadingAction(null);
     }
   }
 
   async function handleDownload() {
     if (!account || !app) return;
+    if (!actionGuard.begin('download')) return;
     setLoadingAction('download');
     try {
       if (previewEnabled) {
@@ -109,6 +114,7 @@ export default function ProductDetail() {
     } catch (e) {
       toastDownloadError(account, app, e);
     } finally {
+      actionGuard.end();
       setLoadingAction(null);
     }
   }

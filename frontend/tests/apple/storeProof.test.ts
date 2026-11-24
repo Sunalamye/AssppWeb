@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { deleteDB } from 'idb';
+import { deleteDB, openDB } from 'idb';
 import { StoreProofClient } from '../../src/apple/storeProof';
+import { appleRequest } from '../../src/apple/request';
+import { buildPlist } from '../../src/apple/plist';
+import { createDiagnosticFlow, getDiagnosticEvents, clearDiagnosticEvents } from '../../src/utils/diagnostics';
 
 vi.mock('../../src/apple/request', () => ({ appleRequest: vi.fn() }));
 
@@ -10,6 +13,7 @@ let counter = 0;
 const device = () => `12345678${(++counter).toString(16).padStart(4, '0')}`;
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
@@ -94,6 +98,39 @@ describe('Store proof browser state', () => {
     expect(calls.map((call) => call.state)).toEqual([undefined, undefined]);
   });
 
+  it('reports a legacy tab blocking deletion and keeps new state writes locked until it closes', async () => {
+    clearDiagnosticEvents();
+    const calls: Record<string, any>[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, options?: RequestInit) => {
+        if (url.endsWith('/health')) return Response.json({ status: 'ready' });
+        calls.push(JSON.parse(String(options?.body)));
+        return Response.json({ mode: 'store', state: 'private-state', headers });
+      }),
+    );
+    const client = new StoreProofClient(device());
+    await client.bootstrap(endpoint);
+    const legacyTab = await openDB('asspp-store-proof', 1);
+    const flow = createDiagnosticFlow('settings');
+    const onBlocked = vi.fn();
+    const cleared = StoreProofClient.clearAll(flow, onBlocked);
+    const restarted = client.bootstrap(endpoint);
+    try {
+      await vi.waitFor(() => expect(onBlocked).toHaveBeenCalledOnce());
+      expect(calls).toHaveLength(1);
+      expect(getDiagnosticEvents()).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ flowId: flow.id, stage: 'clear_data', outcome: 'blocked', reason: 'busy' }),
+        ]),
+      );
+    } finally {
+      legacyTab.close();
+      await Promise.all([cleared, restarted]);
+    }
+    expect(calls.map((call) => call.state)).toEqual([undefined, undefined]);
+  });
+
   it('retains the last valid state when proof generation fails', async () => {
     const calls: Record<string, any>[] = [];
     vi.stubGlobal(
@@ -110,6 +147,132 @@ describe('Store proof browser state', () => {
     await expect(client.proof(endpoint)).rejects.toThrow('PROOF_FAILED');
     await expect(client.proof(endpoint)).resolves.toEqual(headers);
     expect(calls.map((call) => call.state)).toEqual([undefined, 'last-valid-state', 'last-valid-state']);
+  });
+
+  it('retains the previous state and releases the queue if the updated state cannot be persisted', async () => {
+    clearDiagnosticEvents();
+    const flow = createDiagnosticFlow('login');
+    const calls: Record<string, any>[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, options?: RequestInit) => {
+        if (url.endsWith('/health')) return Response.json({ status: 'ready' });
+        calls.push(JSON.parse(String(options?.body)));
+        return Response.json({ mode: 'store', state: `private-state-${calls.length}`, headers });
+      }),
+    );
+    const client = new StoreProofClient(device(), flow);
+    await client.bootstrap(endpoint);
+    vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementationOnce(() => {
+      throw new DOMException('private-storage-message', 'QuotaExceededError');
+    });
+    await expect(client.proof(endpoint)).rejects.toThrow('private-storage-message');
+    await expect(client.proof(endpoint)).resolves.toEqual(headers);
+    expect(calls.map((call) => call.state)).toEqual([undefined, 'private-state-1', 'private-state-1']);
+    const events = getDiagnosticEvents().filter((event) => event.flowId === flow.id);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ stage: 'store_state', outcome: 'failure', reason: 'storage' }),
+        expect.objectContaining({ stage: 'lock', outcome: 'success' }),
+      ]),
+    );
+    expect(JSON.stringify(events)).not.toMatch(/private-storage-message|private-state-/);
+  });
+
+  it('records provisioning-start transport failure without leaking the native error or advancing state', async () => {
+    clearDiagnosticEvents();
+    const flow = createDiagnosticFlow('login');
+    const calls: Record<string, any>[] = [];
+    vi.mocked(appleRequest).mockClear();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, options?: RequestInit) => {
+        if (url.endsWith('/health')) return Response.json({ status: 'ready' });
+        const input = JSON.parse(String(options?.body));
+        calls.push(input);
+        if (input.operation === 'provision-start') throw new Error('private-native-network-error');
+        return Response.json({ mode: 'store', state: 'private-original-state', headers });
+      }),
+    );
+    const client = new StoreProofClient(device(), flow);
+    await client.bootstrap(endpoint);
+    await expect(client.provision('private-challenge', [])).rejects.toMatchObject({ code: 'HELPER_UNAVAILABLE' });
+    await expect(client.proof(endpoint)).resolves.toEqual(headers);
+    expect(calls.map((call) => call.operation)).toEqual(['bootstrap', 'provision-start', 'proof']);
+    expect(calls[2].state).toBe('private-original-state');
+    expect(appleRequest).not.toHaveBeenCalled();
+    const events = getDiagnosticEvents().filter((event) => event.flowId === flow.id);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          stage: 'provision_start',
+          outcome: 'failure',
+          reason: 'network',
+          errorCode: 'HELPER_UNAVAILABLE',
+        }),
+      ]),
+    );
+    expect(JSON.stringify(events)).not.toMatch(/private-native-network-error|private-original-state|private-challenge/);
+  });
+
+  it('does not replay an expired provisioning handle or overwrite state and logs no provisioning secrets', async () => {
+    clearDiagnosticEvents();
+    const flow = createDiagnosticFlow('login');
+    const guid = device();
+    const calls: Record<string, any>[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, options?: RequestInit) => {
+        expect(new Headers(options?.headers).get('X-Asspp-Flow-Id')).toBe(flow.id);
+        if (url.endsWith('/health')) return Response.json({ status: 'ready' });
+        const input = JSON.parse(String(options?.body));
+        calls.push(input);
+        if (input.operation === 'provision-start')
+          return Response.json({
+            pending: 'private-pending-handle',
+            clientData: 'private-client-data',
+            kbsync: 'private-kbsync',
+            identityHeaders: {},
+          });
+        if (input.operation === 'provision-finish')
+          return Response.json(
+            {
+              error: { code: 'PROVISIONING_EXPIRED', message: 'private-native-error' },
+            },
+            { status: 410 },
+          );
+        return Response.json({ mode: 'store', state: 'private-state-before-finish', headers });
+      }),
+    );
+    vi.mocked(appleRequest).mockResolvedValue({
+      status: 200,
+      statusText: '',
+      headers: {},
+      rawHeaders: [],
+      body: buildPlist({ settingInfo: 'private-setting-info', transportKey: 'private-transport-key' }),
+    });
+    const client = new StoreProofClient(guid, flow);
+    await client.bootstrap(endpoint);
+    await expect(client.provision('private-challenge', [])).rejects.toMatchObject({ code: 'PROVISIONING_EXPIRED' });
+    await client.proof(endpoint);
+    expect(calls.map((call) => call.operation)).toEqual(['bootstrap', 'provision-start', 'provision-finish', 'proof']);
+    expect(calls.at(-1)?.state).toBe('private-state-before-finish');
+    const apple = vi.mocked(appleRequest).mock.calls.at(-1)![0];
+    expect(apple.diagnostics).toBe(flow);
+    expect(apple.headers).not.toHaveProperty('X-Asspp-Flow-Id');
+    const events = getDiagnosticEvents().filter((event) => event.flowId === flow.id);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          stage: 'provision_finish',
+          outcome: 'failure',
+          errorCode: 'PROVISIONING_EXPIRED',
+          reason: 'expired',
+        }),
+      ]),
+    );
+    expect(JSON.stringify(events)).not.toMatch(/private-|auth\.itunes\.apple\.com/);
+    expect(JSON.stringify(events)).not.toContain(guid);
   });
 
   it.each(['proof', 'kbsync'] as const)(

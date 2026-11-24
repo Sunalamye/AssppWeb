@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import https from 'https';
 import { BAG_TIMEOUT_MS, BAG_MAX_BYTES } from '../config.js';
+import { observeRequest } from '../utils/diagnostics.js';
 
 const router = Router();
 const userAgent = 'Configurator/2.21 (Macintosh; OS X 27.0.1; 26A434) AppleWebKit/0625.2.5.11.6';
@@ -9,14 +10,17 @@ const userAgent = 'Configurator/2.21 (Macintosh; OS X 27.0.1; 26A434) AppleWebKi
 // The bag response is public data (Apple service URLs, no credentials).
 // The public service directory is fetched without Apple account credentials.
 router.get('/bag', async (req: Request, res: Response) => {
+  const trace = observeRequest(req, res, 'login', 'bag', 'bag');
   const guid = req.query.guid as string | undefined;
   if (!guid) {
+    trace.result({ reason: 'invalid_request' });
     res.status(400).json({ error: 'Missing guid parameter' });
     return;
   }
 
   // Validate guid format (should be hex string)
   if (!/^[a-fA-F0-9]+$/.test(guid)) {
+    trace.result({ reason: 'invalid_request' });
     res.status(400).json({ error: 'Invalid guid format' });
     return;
   }
@@ -41,6 +45,7 @@ router.get('/bag', async (req: Request, res: Response) => {
           resp.on('data', (chunk: Buffer) => {
             totalBytes += chunk.length;
             if (totalBytes > BAG_MAX_BYTES) {
+              trace.result({ reason: 'invalid_response' });
               request.destroy();
               reject(new Error('Bag response too large'));
               return;
@@ -49,6 +54,8 @@ router.get('/bag', async (req: Request, res: Response) => {
           });
           resp.on('end', () => {
             if (resp.statusCode && resp.statusCode >= 400) {
+              trace.event('bag', 'failure', { httpStatus: resp.statusCode, reason: 'http_error' });
+              trace.result({ reason: 'http_error' });
               reject(new Error(`Bag upstream returned HTTP ${resp.statusCode}`));
               return;
             }
@@ -59,6 +66,7 @@ router.get('/bag', async (req: Request, res: Response) => {
       );
       request.on('error', reject);
       request.on('timeout', () => {
+        trace.result({ reason: 'timeout' });
         request.destroy();
         reject(new Error('Bag request timed out'));
       });
@@ -67,14 +75,14 @@ router.get('/bag', async (req: Request, res: Response) => {
     // Extract plist from XML wrapper
     const plistMatch = body.match(/<plist[\s\S]*<\/plist>/);
     if (!plistMatch) {
+      trace.result({ reason: 'invalid_plist' });
       res.status(502).json({ error: 'No plist found in bag response' });
       return;
     }
 
     // Return raw plist XML for the client to parse
     res.type('text/xml').send(plistMatch[0]);
-  } catch (err) {
-    console.error('Bag proxy error:', err instanceof Error ? err.message : err);
+  } catch {
     res.status(502).json({ error: 'Bag request failed' });
   }
 });

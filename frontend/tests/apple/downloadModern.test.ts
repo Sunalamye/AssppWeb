@@ -6,6 +6,7 @@ import { getVersionMetadata } from '../../src/apple/versionLookup';
 import { appleRequest } from '../../src/apple/request';
 import { fetchBag } from '../../src/apple/bag';
 import { buildPlist, parsePlist } from '../../src/apple/plist';
+import { createDiagnosticFlow, getDiagnosticEvents, clearDiagnosticEvents } from '../../src/utils/diagnostics';
 import type { AppleResponse } from '../../src/apple/request';
 import type { Account, Software } from '../../src/types';
 
@@ -145,6 +146,8 @@ describe('native entitlement downloads', () => {
   });
 
   it('preserves cookies and obtains a new proof for each endpoint in the bounded fallback chain', async () => {
+    clearDiagnosticEvents();
+    const flow = createDiagnosticFlow('download');
     vi.mocked(appleRequest)
       .mockResolvedValueOnce({
         ...response({}),
@@ -153,7 +156,7 @@ describe('native entitlement downloads', () => {
       .mockResolvedValueOnce(response({ failureType: '5002' }))
       .mockResolvedValueOnce({ ...response({}, 500), body: '' })
       .mockResolvedValueOnce(success());
-    await downloadProduct(account, app, '987654321');
+    await downloadProduct(account, app, '987654321', flow);
     const requests = vi.mocked(appleRequest).mock.calls.map(([request]) => request);
     expect(requests.map((request) => request.headers?.['X-Apple-AMD'])).toEqual([
       'proof-1',
@@ -171,6 +174,28 @@ describe('native entitlement downloads', () => {
     expect(parsePlist(requests[1].body!).externalVersionId).toBe('987654321');
     expect(parsePlist(requests[2].body!).appExtVrsId).toBe('987654321');
     expect(fetchBag).toHaveBeenCalledOnce();
+    expect(requests.every((request) => request.diagnostics === flow)).toBe(true);
+    const events = getDiagnosticEvents().filter((event) => event.flowId === flow.id);
+    expect(
+      events
+        .filter((event) => event.stage === 'download_product' && event.outcome === 'retry')
+        .map((event) => event.endpoint),
+    ).toEqual(['volume_download', 'redownload', 'update']);
+    const serialized = JSON.stringify(events);
+    for (const secret of [
+      account.email,
+      account.password,
+      account.passwordToken,
+      account.deviceIdentifier,
+      account.directoryServicesIdentifier,
+      app.bundleID,
+      'proof-1',
+      'testSession',
+      'continued',
+      '987654321',
+    ]) {
+      expect(serialized).not.toContain(secret);
+    }
   });
 
   it.each([204, 404, 500, 503])(
@@ -220,6 +245,17 @@ describe('native entitlement downloads', () => {
       }),
     );
     await expect(downloadProduct(account, app, '987654321')).rejects.toThrow('Account is disabled');
+    expect(appleRequest).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { status: 1 },
+    { status: 'failed' },
+    { dialog: { message: 'Account needs review' } },
+    { action: { kind: 'Goto', url: 'https://example.invalid/private-action' } },
+  ])('does not treat metadata accompanied by an explicit rejection as success: %j', async (failure) => {
+    vi.mocked(appleRequest).mockResolvedValue(response({ ...parsePlist(success().body), ...failure }));
+    await expect(downloadProduct(account, app, '987654321')).rejects.toThrow();
     expect(appleRequest).toHaveBeenCalledOnce();
   });
 

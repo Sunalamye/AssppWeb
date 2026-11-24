@@ -1,7 +1,8 @@
 import { useAccountsStore } from '../store/accounts';
 
 export function useAccounts() {
-  const { accounts, loading, loadAccounts, addAccount, removeAccount, updateAccount } = useAccountsStore();
+  const { accounts, loading, loadAccounts, readAccount, addAccount, removeAccount, updateAccount, clearAccounts } =
+    useAccountsStore();
 
   function getAccount(email: string) {
     return accounts.find((a) => a.email === email);
@@ -11,9 +12,11 @@ export function useAccounts() {
     accounts,
     loading,
     loadAccounts,
+    readAccount,
     addAccount,
     removeAccount,
     updateAccount,
+    clearAccounts,
     getAccount,
   };
 }

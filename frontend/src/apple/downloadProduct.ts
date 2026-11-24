@@ -5,7 +5,9 @@ import { extractAndMergeCookies } from './cookies';
 import { buildPlist, parsePlist } from './plist';
 import { appleRequest } from './request';
 import { StoreProofClient } from './storeProof';
+import { createDiagnosticFlow, errorDiagnosticDetails, attachDiagnosticId } from '../utils/diagnostics';
 import { redownloadEndpoint, volumeStoreEndpoint } from './config';
+import type { DiagnosticFlow, DiagnosticDetails } from '../utils/diagnostics';
 import type { StoreDownloadEndpoint } from './config';
 import type { AppleResponse } from './request';
 import type { Account, Software } from '../types';
@@ -14,6 +16,7 @@ export class DownloadError extends Error {
   constructor(
     message: string,
     public readonly code?: string,
+    public readonly diagnostics?: DiagnosticDetails,
   ) {
     super(message);
     this.name = 'DownloadError';
@@ -66,7 +69,10 @@ function responseDict(response: AppleResponse, endpoint: StoreDownloadEndpoint):
   }
   const kind = response.body.trim() ? 'invalid plist' : 'empty response';
   const location = endpoint.host + endpoint.path.split('?')[0];
-  throw new DownloadError(`Apple download: HTTP ${response.status}; ${kind}; ${location}`);
+  throw new DownloadError(`Apple download: HTTP ${response.status}; ${kind}; ${location}`, undefined, {
+    httpStatus: response.status,
+    reason: response.body.trim() ? 'invalid_plist' : 'empty_response',
+  });
 }
 
 function normalizeDownloadFailure(dict: Record<string, any>): Record<string, any> {
@@ -109,6 +115,14 @@ function requireItems(dict: Record<string, any>): void {
     throw new DownloadError(`${dict.customerMessage || 'Apple download failed'} (${code})`, code);
   }
   if (dict.customerMessage) throw new DownloadError(String(dict.customerMessage));
+  if (dict.dialog || dict.action || (dict.status !== undefined && Number(dict.status) !== 0)) {
+    const message = dict.dialog?.explanation ?? dict.dialog?.message;
+    throw new DownloadError(
+      typeof message === 'string' && message ? message : 'Apple rejected the download request',
+      undefined,
+      { reason: 'access_denied' },
+    );
+  }
   if (!Array.isArray(dict.songList) || !dict.songList.length) {
     throw new DownloadError(dict.customerMessage || i18n.t('errors.download.noItems'));
   }
@@ -124,7 +138,7 @@ function validateDownloadItem(dict: Record<string, any>, app: Software, version?
     !metadata.softwareVersionBundleId ||
     (app.bundleID && metadata.softwareVersionBundleId !== app.bundleID)
   ) {
-    throw new DownloadError(i18n.t('errors.download.unexpectedItem'));
+    throw new DownloadError(i18n.t('errors.download.unexpectedItem'), undefined, { reason: 'version_mismatch' });
   }
 }
 
@@ -163,14 +177,39 @@ function downloadSerial(deviceId: string): string {
 }
 
 /** Shared protocol for downloads, version lists, and pinned version metadata. */
-export async function downloadProduct(account: Account, app: Software, versionId?: string) {
-  if (!/^[a-fA-F0-9]{12}$/.test(account.deviceIdentifier)) throw new DownloadError('Invalid account device identifier');
+export async function downloadProduct(
+  account: Account,
+  app: Software,
+  versionId?: string,
+  flow: DiagnosticFlow = createDiagnosticFlow('download'),
+) {
+  const started = Date.now();
+  flow.log('download_product', 'start');
+  try {
+    const result = await requestDownloadProduct(account, app, versionId, flow);
+    flow.log('download_product', 'success', { durationMs: Date.now() - started });
+    return result;
+  } catch (error) {
+    flow.log('download_product', 'failure', { ...errorDiagnosticDetails(error), durationMs: Date.now() - started });
+    throw attachDiagnosticId(error, flow.id);
+  }
+}
+
+async function requestDownloadProduct(
+  account: Account,
+  app: Software,
+  versionId: string | undefined,
+  flow: DiagnosticFlow,
+) {
+  if (!/^[a-fA-F0-9]{12}$/.test(account.deviceIdentifier))
+    throw new DownloadError('Invalid account device identifier', undefined, { reason: 'invalid_request' });
   if (!/^[1-9]\d*$/.test(account.directoryServicesIdentifier) || !account.passwordToken) {
     throw new DownloadError(i18n.t('errors.download.passwordExpired'), '2034');
   }
-  if (versionId && !/^[1-9]\d*$/.test(versionId)) throw new DownloadError('Invalid external version identifier');
+  if (versionId && !/^[1-9]\d*$/.test(versionId))
+    throw new DownloadError('Invalid external version identifier', undefined, { reason: 'invalid_request' });
 
-  const proof = new StoreProofClient(account.deviceIdentifier);
+  const proof = new StoreProofClient(account.deviceIdentifier, flow);
   let cookies = [...account.cookies];
   const storeFront = account.storeFront || (account.store.includes('-') ? account.store : `${account.store}-1`);
   const send = async (
@@ -179,6 +218,14 @@ export async function downloadProduct(account: Account, app: Software, versionId
     entitlement = false,
   ): Promise<AppleResponse> => {
     const url = approvedDownloadURL(endpoint, account.deviceIdentifier);
+    const endpointKind = endpoint.path.startsWith('/r/redownload')
+      ? 'redownload'
+      : endpoint.path.startsWith('/up/updateProduct')
+        ? 'update'
+        : entitlement
+          ? 'ent_download'
+          : 'volume_download';
+    flow.log('download_product', 'transition', { endpoint: endpointKind });
     const payload: Record<string, unknown> = {
       creditDisplay: '',
       guid: account.deviceIdentifier,
@@ -204,28 +251,42 @@ export async function downloadProduct(account: Account, app: Software, versionId
       },
       body: buildPlist(payload),
       cookies,
+      diagnostics: flow,
     });
     cookies = extractAndMergeCookies(response.rawHeaders, cookies);
+    flow.log('download_product', 'transition', { endpoint: endpointKind, httpStatus: response.status });
     // Tokens and URL-bound proofs must not be replayed to a redirect target.
     // A later request resolves its route from a fresh bag instead.
     if ([301, 302, 303, 307, 308].includes(response.status)) {
+      flow.log('download_product', 'blocked', {
+        endpoint: endpointKind,
+        httpStatus: response.status,
+        reason: 'redirect',
+      });
       throw new DownloadError('Apple download redirected; re-authenticate the account before retrying', '2034');
     }
     if (response.headers['x-apple-amd-action']) {
+      flow.log('download_product', 'blocked', {
+        endpoint: endpointKind,
+        httpStatus: response.status,
+        reason: 'device_verification',
+      });
       throw new DownloadError(i18n.t('errors.download.passwordExpired'), '2034');
     }
     return response;
   };
 
-  const bag = await fetchBag(account.deviceIdentifier);
+  const bag = await fetchBag(account.deviceIdentifier, flow);
   let pinnedVersion = versionId;
   const pinVersion = async () => {
     if (!pinnedVersion) {
       try {
-        pinnedVersion = await lookupLatestVersion(account, app);
+        pinnedVersion = await lookupLatestVersion(account, app, flow);
       } catch {
-        throw new DownloadError(i18n.t('errors.download.versionLookupFailed'));
+        throw new DownloadError(i18n.t('errors.download.versionLookupFailed'), undefined, { reason: 'not_found' });
       }
+    } else {
+      flow.log('version_lookup', 'transition', { reason: 'cache_hit' });
     }
     return pinnedVersion;
   };
@@ -246,6 +307,11 @@ export async function downloadProduct(account: Account, app: Software, versionId
         return { dict, updatedCookies: cookies };
       }
     }
+    flow.log('download_product', 'retry', {
+      endpoint: 'volume_download',
+      httpStatus: response.status,
+      reason: 'fallback',
+    });
   }
 
   // Keep the bounded legacy chain for apps that the entitlement endpoint cannot
@@ -260,6 +326,7 @@ export async function downloadProduct(account: Account, app: Software, versionId
 
   // An unpinned dispatch request may return HTTP 500 or the tvOS build.
   await pinVersion();
+  flow.log('download_product', 'retry', { endpoint: 'redownload', reason: 'fallback' });
   const redownload =
     dispatchEndpoint(bag.redownloadURL, 'redownload', account.deviceIdentifier) ??
     redownloadEndpoint(account.deviceIdentifier);
@@ -271,6 +338,7 @@ export async function downloadProduct(account: Account, app: Software, versionId
 
   const update = dispatchEndpoint(bag.updateURL, 'update', account.deviceIdentifier);
   if (update && (emptyServerError || recoverable)) {
+    flow.log('download_product', 'retry', { endpoint: 'update', httpStatus: response.status, reason: 'fallback' });
     dict = responseDict(await send(update, pinnedVersion), update);
   } else if (emptyServerError) {
     responseDict(response, redownload); // Preserve the HTTP failure, not an XML parser error.

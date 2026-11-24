@@ -4,17 +4,21 @@ import { useTranslation } from 'react-i18next';
 import PageContainer from '../Layout/PageContainer';
 import Spinner from '../common/Spinner';
 import { useAccounts } from '../../hooks/useAccounts';
+import { useActionGuard } from '../../hooks/useActionGuard';
 import { useToastStore } from '../../store/toast';
 import { Authenticator, AuthenticationError } from '../../apple/authenticate';
 import { getErrorMessage } from '../../utils/error';
+import { missingAccount, withAccountAction } from '../../utils/accountActions';
+import { attachDiagnosticId, createDiagnosticFlow, errorDiagnosticDetails } from '../../utils/diagnostics';
 import { storeIdToCountry } from '../../apple/config';
 import type { AuthPhase, AuthRetry } from '../../apple/authenticate';
+import type { DiagnosticFlow } from '../../utils/diagnostics';
 
 export default function AccountDetail() {
   const { email } = useParams<{ email: string }>();
   const navigate = useNavigate();
   const { t } = useTranslation();
-  const { accounts, loading: storeLoading, loadAccounts, updateAccount, removeAccount } = useAccounts();
+  const { accounts, loading: storeLoading, loadAccounts, readAccount, updateAccount, removeAccount } = useAccounts();
   const addToast = useToastStore((s) => s.addToast);
 
   const [showDelete, setShowDelete] = useState(false);
@@ -24,12 +28,33 @@ export default function AccountDetail() {
   const [reauthCode, setReauthCode] = useState('');
   const [needsCode, setNeedsCode] = useState(false);
   const authenticator = useRef<Authenticator | null>(null);
+  const authenticatorDevice = useRef('');
+  const loginFlow = useRef<DiagnosticFlow | null>(null);
+  const mounted = useRef(true);
+  const actionGuard = useActionGuard();
+  const decodedEmail = email ? decodeURIComponent(email) : '';
+  const currentEmail = useRef(decodedEmail);
+  currentEmail.current = decodedEmail;
 
   useEffect(() => {
-    loadAccounts();
+    void loadAccounts().catch((error) => addToast(getErrorMessage(error, t('accounts.detail.notFound')), 'error'));
   }, [loadAccounts]);
 
-  const decodedEmail = email ? decodeURIComponent(email) : '';
+  useEffect(() => {
+    loginFlow.current?.log('action', 'cancelled', { reason: 'cancelled' });
+    loginFlow.current = null;
+    authenticator.current = null;
+    authenticatorDevice.current = '';
+    setNeedsCode(false);
+    setReauthCode('');
+    setShowDelete(false);
+  }, [decodedEmail]);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   const account = accounts.find((a) => a.email === decodedEmail);
 
   if (storeLoading) {
@@ -55,33 +80,59 @@ export default function AccountDetail() {
 
   async function handleReauth() {
     if (!account) return;
+    if (!actionGuard.begin('login')) return;
+    const flow = (loginFlow.current ??= createDiagnosticFlow('login'));
+    flow.log('action', 'start');
     setReauthing(true);
 
     try {
-      if (!needsCode || !authenticator.current)
-        authenticator.current = new Authenticator(account.deviceIdentifier, account.cookies);
-      const updated = await authenticator.current.authenticate(
-        account.email,
-        account.password,
-        needsCode && reauthCode ? reauthCode : undefined,
-        setReauthRetry,
-        setReauthPhase,
-      );
-      await updateAccount(updated);
+      await withAccountAction(account.email, flow, async () => {
+        const current = await readAccount(account.email, flow);
+        if (!current) throw missingAccount(flow);
+        const continuing = needsCode && authenticatorDevice.current === current.deviceIdentifier;
+        if (!continuing || !authenticator.current) {
+          authenticator.current = new Authenticator(current.deviceIdentifier, current.cookies, flow, current);
+          authenticatorDevice.current = current.deviceIdentifier;
+        }
+        const updated = await authenticator.current.authenticate(
+          current.email,
+          current.password,
+          continuing ? reauthCode : undefined,
+          setReauthRetry,
+          setReauthPhase,
+          flow,
+        );
+        if (!mounted.current || currentEmail.current !== decodedEmail)
+          throw new DOMException('The account view was changed.', 'AbortError');
+        await updateAccount(updated, flow);
+      });
+      flow.log('action', 'success');
+      loginFlow.current = null;
+      authenticator.current = null;
       setNeedsCode(false);
       setReauthCode('');
       addToast(t('accounts.detail.reauthSuccess'), 'success');
     } catch (err) {
+      attachDiagnosticId(err, flow.id);
+      if (!mounted.current || currentEmail.current !== decodedEmail) {
+        flow.log('action', 'cancelled', { reason: 'cancelled' });
+        return;
+      }
       if (err instanceof AuthenticationError && err.codeRequired) {
+        flow.log('verification', 'transition', { codeRequired: true, reason: 'verification_required' });
         setNeedsCode(true);
-        addToast(err.message, 'error');
+        addToast(getErrorMessage(err, t('accounts.detail.reauthFailed')), 'error');
       } else {
+        flow.log('action', 'failure', errorDiagnosticDetails(err));
         setNeedsCode(false);
         setReauthCode('');
         authenticator.current = null;
+        loginFlow.current = null;
         addToast(getErrorMessage(err, t('accounts.detail.reauthFailed')), 'error');
       }
     } finally {
+      actionGuard.end();
+      if (!mounted.current) return;
       setReauthRetry(null);
       setReauthPhase(null);
       setReauthing(false);
@@ -90,9 +141,25 @@ export default function AccountDetail() {
 
   async function handleDelete() {
     if (!account) return;
-    await removeAccount(account.email);
-    addToast(t('accounts.detail.deleteSuccess'), 'success');
-    navigate('/accounts');
+    if (!actionGuard.begin('account')) return;
+    const flow = createDiagnosticFlow('account');
+    flow.log('action', 'start');
+    setReauthing(true);
+    try {
+      await withAccountAction(account.email, flow, () => removeAccount(account.email, flow));
+      loginFlow.current?.log('action', 'cancelled', { reason: 'cancelled' });
+      loginFlow.current = null;
+      authenticator.current = null;
+      flow.log('action', 'success');
+      addToast(t('accounts.detail.deleteSuccess'), 'success');
+      navigate('/accounts');
+    } catch (error) {
+      flow.log('action', 'failure', errorDiagnosticDetails(error));
+      addToast(getErrorMessage(attachDiagnosticId(error, flow.id), t('accounts.detail.notFound')), 'error');
+    } finally {
+      actionGuard.end();
+      if (mounted.current) setReauthing(false);
+    }
   }
 
   const countryCode = storeIdToCountry(account.store);
@@ -175,6 +242,7 @@ export default function AccountDetail() {
           {!showDelete ? (
             <button
               onClick={() => setShowDelete(true)}
+              disabled={reauthing}
               className="min-h-11 rounded-full bg-red-50 px-5 py-2 text-sm font-semibold text-red-600 transition-colors hover:bg-red-100 dark:bg-red-950/40 dark:text-red-400 dark:hover:bg-red-950/70"
             >
               {t('accounts.detail.delete')}
@@ -184,6 +252,7 @@ export default function AccountDetail() {
               <span className="text-sm text-gray-600 dark:text-gray-400">{t('accounts.detail.areYouSure')}</span>
               <button
                 onClick={handleDelete}
+                disabled={reauthing}
                 className="min-h-11 rounded-full bg-red-600 px-5 py-2 text-sm font-semibold text-white transition-colors hover:bg-red-700"
               >
                 {t('accounts.detail.confirmDelete')}

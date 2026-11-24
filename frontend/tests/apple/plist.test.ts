@@ -39,6 +39,39 @@ describe('apple/plist', () => {
   });
 
   describe('parsePlist', () => {
+    it.each(['0junk', '0.5', '', '9007199254740993'])(
+      'rejects malformed or unsafe integer %s instead of accepting a success code',
+      (value) => {
+        expect(() => parsePlist(`<plist><dict><key>status</key><integer>${value}</integer></dict></plist>`)).toThrow(
+          'Invalid plist integer',
+        );
+      },
+    );
+
+    it('rejects contradictory duplicate status keys', () => {
+      expect(() =>
+        parsePlist(
+          '<plist><dict><key>status</key><integer>1</integer><key>status</key><integer>0</integer></dict></plist>',
+        ),
+      ).toThrow('Duplicate plist dictionary key');
+    });
+
+    it('does not treat prototype properties as response fields', () => {
+      const result = parsePlist(
+        '<plist><dict><key>__proto__</key><dict><key>status</key><integer>0</integer></dict></dict></plist>',
+      );
+      expect(result.status).toBeUndefined();
+      expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+    });
+
+    it.each([
+      '<dict><key>status</key></dict>',
+      '<dict><string>status</string><integer>0</integer></dict>',
+      '<dict/><dict/>',
+    ])('rejects incomplete dictionary shapes', (body) => {
+      expect(() => parsePlist(`<plist>${body}</plist>`)).toThrow();
+    });
+
     it('should parse XML plist string', () => {
       const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

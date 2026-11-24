@@ -286,13 +286,21 @@
       "conflictOverwrite": "ローカルを上書き",
       "conflictSkip": "ローカルを保持 (新規のみ追加)",
       "cleared": "すべてのローカルデータを消去しました",
-      "clearFailed": "ローカルデータを削除できませんでした。他のタブを閉じて再試行してください。"
+      "clearFailed": "ローカルデータを削除できませんでした。他のタブを閉じて再試行してください。",
+      "importFailed": "アカウントのインポートに失敗しました。再試行してください。",
+      "closeOtherTabs": "他のタブがこのデータを使用しています。削除を完了するには、このサイトの他のタブを閉じてください。"
     },
     "about": {
       "title": "概要",
       "description": "Asspp Web — Appleアプリとライセンスの管理。",
       "buildCommit": "ビルドコミット",
       "buildDate": "ビルド日時"
+    },
+    "diagnostics": {
+      "title": "診断ログ",
+      "description": "ログイン、ライセンス取得、ダウンロードの手順と結果を記録し、サービスのログへ送信します。最新200件を調査用にエクスポートできます。パスワード、Cookie、トークン、デバイス認証データは含みません。",
+      "export": "診断ログをエクスポート",
+      "empty": "診断ログはまだありません。"
     }
   },
   "countries": {
@@ -445,7 +453,8 @@
       "noSinf": "レスポンスに sinf が見つかりません",
       "tooManyRedirects": "リダイレクトが多すぎます",
       "versionLookupFailed": "このアカウントのストアで最新の iOS バージョンを取得できません。アプリがこの地域で利用できるか確認してください。",
-      "unexpectedItem": "Apple が別のアプリまたはバージョンを返したため、ダウンロードを停止しました。"
+      "unexpectedItem": "Apple が別のアプリまたはバージョンを返したため、ダウンロードを停止しました。",
+      "enqueueUncertain": "ダウンロードが作成されたか確認できません。再試行する前にダウンロード一覧を確認してください。"
     },
     "purchase": {
       "paidNotSupported": "有料アプリの購入はサポートされていません",
@@ -455,7 +464,12 @@
       "termsRequired": "利用規約に同意する必要があります: {{url}}",
       "failed": "購入失敗: {{failureType}}",
       "failedGeneral": "アプリの購入に失敗しました",
-      "unknownError": "不明なエラーが発生しました"
+      "unknownError": "不明なエラーが発生しました",
+      "verificationRequired": "Apple の2ファクタ認証が必要です。アカウント画面で再認証し、確認コードを入力してからライセンスを取得してください。",
+      "deviceVerificationFailed": "Apple がこのデバイスを確認できませんでした。アカウント画面で再認証してからライセンスを取得してください。",
+      "termsRequiredOnDevice": "App Store の利用規約への同意が必要です。同じ Apple アカウントで App Store を開き、規約を確認して同意した後に再試行してください。",
+      "httpFailure": "Apple への購入リクエストが失敗しました（HTTP {{status}}）。",
+      "invalidResponse": "Apple の購入応答を読み取れませんでした（HTTP {{status}}）。"
     },
     "auth": {
       "requiresVerification": "2ファクタ認証コードが必要です。ポップアップが出ない場合は、https://account.apple.com でサインインしてアラートをトリガーし、コード欄に入力してください。",
@@ -466,6 +480,11 @@
       "unknownReason": "不明な理由により認証に失敗しました",
       "transientFailure": "認証に失敗しました：{{attempts}} 回試行しましたが Apple から応答がありません（HTTP {{statuses}}）。しばらくしてから再度お試しください。",
       "retryLater": "認証に失敗しました：Apple から {{seconds}} 秒待つよう求められました。しばらくしてから再度お試しください。"
+    },
+    "account": {
+      "busy": "このアカウントで別の操作を実行中です。完了してから再試行してください。",
+      "clearing": "ローカルデータを消去しています。お待ちください。",
+      "missing": "このアカウントは存在しません。再度追加してください。"
     }
   },
   "toast": {

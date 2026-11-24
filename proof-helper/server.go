@@ -10,6 +10,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,19 +28,23 @@ type pendingRecord struct {
 	runtime  pendingRuntime
 	expires  time.Time
 	cancel   context.CancelFunc
+	trace    *helperTrace
+	ctx      context.Context
 }
 
 type proofService struct {
-	runtime proofRuntime
-	ctx     context.Context
-	cancel  context.CancelFunc
-	gate    chan struct{}
-	ready   atomic.Int32              // 0 loading, 1 ready, 2 failed
-	pending map[string]*pendingRecord // only accessed while gate is held
-	closed  sync.Once
-	now     func() time.Time
-	jobTTL  time.Duration
-	vmTTL   time.Duration
+	runtime   proofRuntime
+	ctx       context.Context
+	cancel    context.CancelFunc
+	gate      chan struct{}
+	ready     atomic.Int32              // 0 loading, 1 ready, 2 failed
+	pending   map[string]*pendingRecord // only accessed while gate is held
+	closed    sync.Once
+	now       func() time.Time
+	jobTTL    time.Duration
+	vmTTL     time.Duration
+	logMu     sync.Mutex
+	logWriter io.Writer
 }
 
 func newProofService(runtime proofRuntime) *proofService {
@@ -48,22 +53,29 @@ func newProofService(runtime proofRuntime) *proofService {
 		runtime: runtime, ctx: ctx, cancel: cancel,
 		gate: make(chan struct{}, 1), pending: make(map[string]*pendingRecord),
 		now: time.Now, jobTTL: requestTimeout, vmTTL: pendingTTL,
+		logWriter: os.Stdout,
 	}
 	go s.expiryLoop()
 	return s
 }
 
 func (s *proofService) prepare(ctx context.Context) error {
+	trace := s.newTrace(nil)
+	trace.stage = "transport"
+	trace.start()
 	if err := s.acquire(ctx); err != nil {
 		s.ready.Store(2)
+		trace.emit("transport", "cancelled", "cancelled", 0, "", "")
 		return err
 	}
 	defer s.release()
 	if err := s.runtime.Prepare(ctx); err != nil {
 		s.ready.Store(2)
+		trace.emit("transport", "failure", "unavailable", 0, "HELPER_UNAVAILABLE", "")
 		return err
 	}
 	s.ready.Store(1)
+	trace.emit("transport", "success", "", 0, "", "")
 	return nil
 }
 
@@ -111,6 +123,7 @@ func (s *proofService) expirePending() {
 			delete(s.pending, handle)
 			pending.cancel()
 			_ = pending.runtime.Close()
+			pending.trace.emit("provision_finish", "cancelled", "expired", 0, "PROVISIONING_EXPIRED", "")
 		}
 	}
 }
@@ -130,6 +143,20 @@ func (s *proofService) Close() {
 }
 
 func (s *proofService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	trace := s.newTrace(r)
+	observed := &diagnosticResponseWriter{ResponseWriter: w, status: http.StatusOK}
+	w = observed
+	defer func() {
+		trace.start()
+		outcome := "success"
+		if observed.status >= 400 {
+			outcome = "failure"
+		}
+		if r.Context().Err() != nil {
+			outcome, observed.reason = "cancelled", "cancelled"
+		}
+		trace.emit(trace.stage, outcome, observed.reason, observed.status, observed.code, "")
+	}()
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -140,6 +167,8 @@ func (s *proofService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	if r.URL.Path == "/health" {
+		trace.stage = "bootstrap"
+		trace.start()
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", "GET")
 			writeAPIError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "Use GET.")
@@ -151,6 +180,9 @@ func (s *proofService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			status, code = "ready", http.StatusOK
 		case 2:
 			status = "error"
+		}
+		if status != "ready" {
+			observed.reason = "not_ready"
 		}
 		writeJSON(w, code, map[string]string{"status": status, "sourceRevision": sourceRevision})
 		return
@@ -193,14 +225,23 @@ func (s *proofService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid device verification request.")
 		return
 	}
+	stages := map[string]string{"bootstrap": "bootstrap", "proof": "proof", "provision-start": "provision_start", "provision-finish": "provision_finish", "kbsync": "kbsync"}
+	trace.stage = stages[request.operation]
+	if request.operation == "kbsync" {
+		trace.flow = "download"
+	}
+	trace.start()
 	ctx, cancel := context.WithTimeout(r.Context(), s.jobTTL)
+	ctx = context.WithValue(ctx, diagnosticContextKey{}, trace)
 	stop := context.AfterFunc(s.ctx, cancel)
 	defer stop()
 	defer cancel()
+	trace.emit("lock", "start", "lock_wait", 0, "", "")
 	if err := s.acquire(ctx); err != nil {
 		writeRuntimeError(w, ctx, err)
 		return
 	}
+	trace.emit("lock", "success", "lock_acquired", 0, "", "")
 	defer s.release()
 	s.expirePending()
 	switch request.operation {
@@ -214,7 +255,7 @@ func (s *proofService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.provisionFinish(w, ctx, request)
 	case "kbsync":
 		value, err := s.runtime.KBSync(ctx, request.hardwareID, request.dsid)
-		if err != nil || len(value) == 0 || len(value) > maxNativeBytes {
+		if err != nil || ctx.Err() != nil || len(value) == 0 || len(value) > maxNativeBytes {
 			writeRuntimeError(w, ctx, err)
 			return
 		}
@@ -225,10 +266,11 @@ func (s *proofService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *proofService) bootstrap(w http.ResponseWriter, ctx context.Context, r *proofRequest) {
 	if r.state != nil && len(r.state.Native.Provisioning) != 0 {
 		headers, encoded, err := s.runtime.Proof(ctx, r.state.nativeBytes(), r.endpoint, r.hardwareID)
-		if err == nil {
+		if err == nil && ctx.Err() == nil {
 			normalized, headerErr := normalizeStoreHeaders(headers)
 			updated, stateErr := withUpdatedNative(r.state, encoded)
 			if headerErr == nil && stateErr == nil {
+				traceFromContext(ctx).emit("bootstrap", "transition", "cache_hit", 0, "", "store")
 				writeJSON(w, http.StatusOK, map[string]any{"state": updated, "headers": normalized, "mode": "store"})
 				return
 			}
@@ -237,13 +279,14 @@ func (s *proofService) bootstrap(w http.ResponseWriter, ctx context.Context, r *
 			writeRuntimeError(w, ctx, ctx.Err())
 			return
 		}
+		traceFromContext(ctx).emit("bootstrap", "transition", "fallback", 0, "", "bootstrap")
 	}
 	var encoded []byte
 	if r.state != nil {
 		encoded = r.state.nativeBytes()
 	}
 	headers, updated, err := s.runtime.Bootstrap(ctx, encoded)
-	if err != nil {
+	if err != nil || ctx.Err() != nil {
 		writeRuntimeError(w, ctx, err)
 		return
 	}
@@ -271,7 +314,7 @@ func (s *proofService) proof(w http.ResponseWriter, ctx context.Context, r *proo
 		return
 	}
 	headers, encoded, err := s.runtime.Proof(ctx, r.state.nativeBytes(), r.endpoint, r.hardwareID)
-	if err != nil {
+	if err != nil || ctx.Err() != nil {
 		writeRuntimeError(w, ctx, err)
 		return
 	}
@@ -320,7 +363,7 @@ func (s *proofService) provisionStart(w http.ResponseWriter, ctx context.Context
 		writeRuntimeError(w, ctx, errInvalidRequest)
 		return
 	}
-	s.pending[handle] = &pendingRecord{deviceID: r.deviceID, state: r.state, runtime: runtime, expires: expires, cancel: cancel}
+	s.pending[handle] = &pendingRecord{deviceID: r.deviceID, state: r.state, runtime: runtime, expires: expires, cancel: cancel, trace: traceFromContext(ctx), ctx: vmCtx}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"pending": handle, "clientData": base64.StdEncoding.EncodeToString(clientData),
 		"kbsync": base64.StdEncoding.EncodeToString(kbsync), "identityHeaders": r.state.IdentityHeaders,
@@ -339,7 +382,11 @@ func (s *proofService) provisionFinish(w http.ResponseWriter, ctx context.Contex
 	stop := context.AfterFunc(ctx, pending.cancel)
 	defer stop()
 	encoded, err := pending.runtime.Finish(r.settingInfo, r.transportKey, r.keybag)
-	if err != nil {
+	if pending.ctx != nil && pending.ctx.Err() != nil && ctx.Err() == nil {
+		writeAPIError(w, http.StatusGone, "PROVISIONING_EXPIRED", "Device provisioning has expired. Sign in again.")
+		return
+	}
+	if err != nil || ctx.Err() != nil {
 		writeRuntimeError(w, ctx, err)
 		return
 	}
@@ -367,10 +414,14 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 }
 
 func writeAPIError(w http.ResponseWriter, status int, code, message string) {
+	if observed, ok := w.(*diagnosticResponseWriter); ok {
+		observed.code, observed.reason = code, helperErrorReason(code)
+	}
 	writeJSON(w, status, map[string]any{"error": map[string]string{"code": code, "message": message}})
 }
 
 func writeRuntimeError(w http.ResponseWriter, ctx context.Context, err error) {
+	logNativeHTTPStatus(ctx, err)
 	if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		writeAPIError(w, http.StatusGatewayTimeout, "PROOF_TIMEOUT", "Device verification timed out. Try again.")
 		return

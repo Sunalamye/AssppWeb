@@ -1,6 +1,8 @@
 import i18n from '../i18n';
 import { downloadProduct, DownloadError } from './downloadProduct';
 import { buildPlist } from './plist';
+import { createDiagnosticFlow, errorDiagnosticDetails, attachDiagnosticId } from '../utils/diagnostics';
+import type { DiagnosticFlow } from '../utils/diagnostics';
 import type { Account, Software, DownloadOutput, Sinf } from '../types';
 
 export { DownloadError } from './downloadProduct';
@@ -9,8 +11,23 @@ export async function getDownloadInfo(
   account: Account,
   app: Software,
   externalVersionId?: string,
+  flow: DiagnosticFlow = createDiagnosticFlow('download'),
 ): Promise<{ output: DownloadOutput; updatedCookies: typeof account.cookies }> {
-  const { dict, updatedCookies } = await downloadProduct(account, app, externalVersionId);
+  try {
+    return await prepareDownloadInfo(account, app, externalVersionId, flow);
+  } catch (error) {
+    flow.log('download_product', 'failure', { ...errorDiagnosticDetails(error) });
+    throw attachDiagnosticId(error, flow.id);
+  }
+}
+
+async function prepareDownloadInfo(
+  account: Account,
+  app: Software,
+  externalVersionId: string | undefined,
+  flow: DiagnosticFlow,
+) {
+  const { dict, updatedCookies } = await downloadProduct(account, app, externalVersionId, flow);
   const item = dict.songList[0];
   const url = item.URL as string;
   if (!url) throw new DownloadError(i18n.t('errors.download.missingUrl'));

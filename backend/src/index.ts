@@ -15,11 +15,15 @@ import installRoutes from './routes/install.js';
 import settingsRoutes from './routes/settings.js';
 import bagRoutes from './routes/bag.js';
 import storeProofRoutes from './routes/storeProof.js';
+import diagnosticsRoutes from './routes/diagnostics.js';
 
 const app = express();
 
 // Middleware
 app.use(httpsRedirect);
+// Authenticate and enforce the small diagnostic body limit before the generic
+// 50 MiB package-metadata parser can consume an untrusted diagnostic payload.
+app.use('/api/diagnostics', accessAuth, diagnosticsRoutes);
 app.use(express.json({ limit: '50mb' }));
 
 // API routes

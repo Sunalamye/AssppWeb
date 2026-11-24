@@ -2,9 +2,10 @@ import { buildPlist, parsePlist } from '../plist';
 import { appleRequest } from '../request';
 import { createHandshake } from './handshake';
 import { createSigner } from './signer';
+import type { DiagnosticFlow } from '../../utils/diagnostics';
 import type { Bytes } from './bytes';
 
-export async function connectSAP() {
+export async function connectSAP(diagnostics?: DiagnosticFlow) {
   async function exchange(host: string, path: string, key: string, payload?: Bytes): Promise<Bytes> {
     const response = await appleRequest({
       method: payload ? 'POST' : 'GET',
@@ -12,6 +13,7 @@ export async function connectSAP() {
       path,
       headers: { 'Content-Type': 'application/x-apple-plist' },
       body: payload ? buildPlist({ 'sign-sap-setup-buffer': payload }) : undefined,
+      diagnostics,
     });
     if (response.status !== 200 || response.body.length > 2 * 1024 * 1024)
       throw new Error(`SAP setup failed (HTTP ${response.status})`);

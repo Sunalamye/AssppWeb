@@ -1,10 +1,12 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { apiGet, apiPost, apiDelete } from '../../src/api/client';
 
 describe('api/client', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    sessionStorage.clear();
   });
+  afterEach(() => vi.useRealTimers());
 
   describe('apiGet', () => {
     it('should make GET request and return JSON', async () => {
@@ -18,6 +20,7 @@ describe('api/client', () => {
       expect(result).toEqual(mockData);
       expect(fetch).toHaveBeenCalledWith('/api/test', {
         headers: {},
+        signal: expect.any(AbortSignal),
       });
     });
 
@@ -45,6 +48,7 @@ describe('api/client', () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ data: 'value' }),
+        signal: expect.any(AbortSignal),
       });
     });
 
@@ -59,6 +63,7 @@ describe('api/client', () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: undefined,
+        signal: expect.any(AbortSignal),
       });
     });
   });
@@ -73,6 +78,7 @@ describe('api/client', () => {
       expect(fetch).toHaveBeenCalledWith('/api/test/123', {
         method: 'DELETE',
         headers: {},
+        signal: expect.any(AbortSignal),
       });
     });
 
@@ -84,5 +90,48 @@ describe('api/client', () => {
 
       await expect(apiDelete('/api/test/123')).rejects.toThrow('Server error');
     });
+  });
+
+  it('carries flow headers and preserves the real access token', async () => {
+    sessionStorage.setItem('auth-token', 'synthetic-access-token');
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({ ok: true, json: async () => ({}) } as Response);
+    await apiPost('/api/downloads', {}, { 'X-Asspp-Flow-Id': 'synthetic-flow-id', 'X-Access-Token': 'wrong' });
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/downloads',
+      expect.objectContaining({
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Asspp-Flow-Id': 'synthetic-flow-id',
+          'X-Access-Token': 'synthetic-access-token',
+        },
+      }),
+    );
+  });
+
+  it('retains safe HTTP status details without adding a retry', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: false,
+      status: 503,
+      text: async () => 'Unavailable',
+    } as Response);
+    await expect(apiPost('/api/downloads', {})).rejects.toMatchObject({
+      message: 'Unavailable',
+      diagnostics: { httpStatus: 503, reason: 'http_error' },
+    });
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  it('aborts a stalled POST after 30 seconds without automatically repeating it', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      (_input, init) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+        }),
+    );
+    const result = apiPost('/api/downloads', {}).catch((error) => error);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(await result).toMatchObject({ name: 'TimeoutError', diagnostics: { reason: 'timeout' } });
+    expect(fetch).toHaveBeenCalledOnce();
   });
 });

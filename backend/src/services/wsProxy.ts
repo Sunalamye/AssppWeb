@@ -23,13 +23,29 @@ wisp.options.allow_loopback_ips = false;
 
 export function setupWsProxy(server: HttpServer) {
   server.on('upgrade', (req, socket, head) => {
-    if (req.url?.startsWith('/wisp')) {
+    const originalURL = req.url || '';
+    // The upgrade URL can contain the site access token. Clear it before any
+    // library, rejected upgrade, or later error handler can log the request.
+    req.url = '/';
+    let url: URL;
+    try {
+      url = new URL(originalURL, 'http://localhost');
+    } catch {
+      socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    if (
+      originalURL.startsWith('/') &&
+      url.origin === 'http://localhost' &&
+      ['/wisp', '/wisp/'].includes(url.pathname)
+    ) {
+      req.url = '/wisp/';
       if (accessPasswordHash) {
-        const url = new URL(req.url, 'http://localhost');
         // Cloudflare URL normalization may append a trailing slash to the query
         // string (e.g. ?token=abc/ instead of ?token=abc), so strip it.
         const token = (url.searchParams.get('token') || '').replace(/\/+$/, '');
-        if (!verifyAccessToken(token)) {
+        if (url.searchParams.getAll('token').length !== 1 || !verifyAccessToken(token)) {
           socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
           socket.destroy();
           return;

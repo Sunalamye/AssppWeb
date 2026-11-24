@@ -4,6 +4,12 @@ import { fetchBag } from '../../src/apple/bag';
 import { buildPlist, parsePlist } from '../../src/apple/plist';
 import { appleRequest } from '../../src/apple/request';
 import { connectSAP } from '../../src/apple/sap';
+import {
+  createDiagnosticFlow,
+  getDiagnosticEvents,
+  clearDiagnosticEvents,
+  getDiagnosticId,
+} from '../../src/utils/diagnostics';
 
 vi.mock('../../src/apple/request', () => ({ appleRequest: vi.fn() }));
 vi.mock('../../src/apple/sap', () => ({ connectSAP: vi.fn() }));
@@ -78,6 +84,68 @@ describe('native authentication with machine provisioning', () => {
     vi.mocked(connectSAP).mockResolvedValue({ sign });
   });
   afterEach(() => vi.unstubAllGlobals());
+
+  it('preserves the same account storefront when reauthentication only returns a request echo', async () => {
+    helper();
+    vi.mocked(appleRequest).mockResolvedValue(success());
+    const auth = new Authenticator('aabbccddee91', [], undefined, {
+      directoryServicesIdentifier: '123456',
+      store: '143462',
+      storeFront: '143462-1,29',
+    });
+    await expect(auth.authenticate('private@example.invalid', 'private-password')).resolves.toMatchObject({
+      store: '143462',
+      storeFront: '143462-1,29',
+    });
+  });
+
+  it('accepts an authoritative storefront assignment instead of preserving the saved value', async () => {
+    helper();
+    const response = success();
+    response.headers['x-set-apple-store-front'] = '143441-1,34';
+    vi.mocked(appleRequest).mockResolvedValue(response);
+    const auth = new Authenticator('aabbccddee92', [], undefined, {
+      directoryServicesIdentifier: '123456',
+      store: '143462',
+      storeFront: '143462-1,29',
+    });
+    await expect(auth.authenticate('private@example.invalid', 'private-password')).resolves.toMatchObject({
+      store: '143441',
+      storeFront: '143441-1,34',
+    });
+  });
+
+  it('never reuses storefront state belonging to a different DSID', async () => {
+    helper();
+    vi.mocked(appleRequest).mockResolvedValue(success());
+    const auth = new Authenticator('aabbccddee93', [], undefined, {
+      directoryServicesIdentifier: '654321',
+      store: '143462',
+      storeFront: '143462-1,29',
+    });
+    await expect(auth.authenticate('private@example.invalid', 'private-password')).resolves.toMatchObject({
+      store: '143470',
+      storeFront: '143470-1,29',
+    });
+  });
+
+  it('keeps a storefront assignment across a later redirect response that only echoes routing', async () => {
+    helper();
+    vi.mocked(appleRequest)
+      .mockResolvedValueOnce(
+        reply(
+          null,
+          {
+            location: 'https://p47-buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate',
+            'x-set-apple-store-front': '143441-1,34',
+          },
+          302,
+        ),
+      )
+      .mockResolvedValueOnce(success());
+    const account = await newAuth().authenticate('private@example.invalid', 'private-password');
+    expect(account.storeFront).toBe('143441-1,34');
+  });
 
   it('completes RP -> SP -> browser finish -> 2FA without sending Apple credentials to the helper', async () => {
     const calls = helper('bootstrap');
@@ -309,5 +377,62 @@ describe('native authentication with machine provisioning', () => {
     await expect(newAuth().authenticate('test@example.invalid', 'password', '12x456')).rejects.toThrow('six digits');
     expect(appleRequest).not.toHaveBeenCalled();
     expect(fetchBag).not.toHaveBeenCalled();
+  });
+
+  it('keeps one safe diagnostic flow across the 2FA continuation without forwarding it to Apple', async () => {
+    clearDiagnosticEvents();
+    helper();
+    vi.mocked(appleRequest)
+      .mockResolvedValueOnce(reply({ customerMessage: 'MZFinance.BadLogin.Configurator_message' }))
+      .mockResolvedValueOnce(success());
+    const flow = createDiagnosticFlow('login');
+    const unrelated = createDiagnosticFlow('login');
+    const guid = `aabbccdd${(++device).toString(16).padStart(4, '0')}`;
+    const auth = new Authenticator(guid, [], flow);
+    let waiting: unknown;
+    try {
+      await auth.authenticate('private@example.invalid', 'private-password');
+    } catch (error) {
+      waiting = error;
+    }
+    expect(getDiagnosticId(waiting)).toBe(flow.id);
+    await auth.authenticate('private@example.invalid', 'private-password', '654321', undefined, undefined, unrelated);
+
+    const events = getDiagnosticEvents();
+    expect(events.every((event) => event.flowId === flow.id)).toBe(true);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          stage: 'verification',
+          outcome: 'transition',
+          reason: 'verification_required',
+          codeRequired: true,
+        }),
+        expect.objectContaining({ stage: 'verification', outcome: 'success', codeRequired: false }),
+      ]),
+    );
+    for (const [, options] of vi.mocked(fetch).mock.calls) {
+      expect(new Headers(options?.headers).get('X-Asspp-Flow-Id')).toBe(flow.id);
+      expect(String(options?.body ?? '')).not.toContain(flow.id);
+    }
+    for (const [request] of vi.mocked(appleRequest).mock.calls) {
+      expect(request.diagnostics).toBe(flow);
+      expect(request.headers).not.toHaveProperty('X-Asspp-Flow-Id');
+    }
+    const serialized = JSON.stringify(events);
+    for (const secret of [
+      'private@example.invalid',
+      'private-password',
+      'private-token',
+      '654321',
+      guid,
+      'initial-state',
+      'fresh-proof',
+      'machine-proof',
+      'device-identity',
+      'auth.itunes.apple.com',
+    ]) {
+      expect(serialized).not.toContain(secret);
+    }
   });
 });

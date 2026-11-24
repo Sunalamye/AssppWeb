@@ -1,5 +1,10 @@
 import 'fake-indexeddb/auto';
 import '@testing-library/jest-dom/vitest';
+import { vi } from 'vitest';
+
+// Protocol tests must not make network calls just because an observed action logs.
+// Dedicated transport tests unmock this module and verify delivery separately.
+vi.mock('../src/utils/diagnosticTransport', () => ({ enqueueDiagnosticEvent: vi.fn() }));
 
 // Mock localStorage
 const store: Record<string, string> = {};

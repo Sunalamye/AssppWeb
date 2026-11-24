@@ -4,12 +4,36 @@ import { v4 as uuidv4 } from 'uuid';
 import { config, DOWNLOAD_TIMEOUT_MS } from '../config.js';
 import { inject } from './sinfInjector.js';
 import { ChunkedDownloader } from './chunkedDownloader.js';
+import { createServerDiagnostic } from '../utils/diagnostics.js';
+import type { DiagnosticEvent, DiagnosticDetails, ServerDiagnostic } from '../utils/diagnostics.js';
 import type { DownloadTask, Software, Sinf } from '../types/index.js';
 
 const tasks = new Map<string, DownloadTask>();
 const abortControllers = new Map<string, AbortController>();
 const chunkDownloaders = new Map<string, ChunkedDownloader>();
 const progressListeners = new Map<string, Set<(task: DownloadTask) => void>>();
+const activeRuns = new Map<string, symbol>();
+const runningJobs = new Map<string, Promise<void>>();
+const taskDiagnostics = new Map<string, ServerDiagnostic>();
+
+function taskTrace(task: DownloadTask): ServerDiagnostic {
+  let trace = taskDiagnostics.get(task.id);
+  if (!trace) {
+    trace = createServerDiagnostic('download');
+    taskDiagnostics.set(task.id, trace);
+  }
+  return trace;
+}
+
+function setTaskState(task: DownloadTask, state: DownloadTask['status'], reason?: DiagnosticDetails['reason']) {
+  task.status = state;
+  taskTrace(task).event(
+    'task_state',
+    state === 'completed' ? 'success' : state === 'failed' ? 'failure' : 'transition',
+    reason ? { reason } : {},
+    { taskId: task.id, taskState: state },
+  );
+}
 
 const PACKAGES_DIR = path.join(config.dataDir, 'packages');
 const TASKS_FILE = path.join(config.dataDir, 'tasks.json');
@@ -86,6 +110,19 @@ function persistTasks() {
   fs.writeFileSync(TASKS_FILE, JSON.stringify(completed, null, 2));
 }
 
+function deleteCleanupTask(id: string): boolean {
+  const task = tasks.get(id);
+  if (!task) return false;
+  const trace = taskTrace(task);
+  try {
+    return deleteTask(id);
+  } catch {
+    // One inaccessible package must not stop cleanup or an unrelated download.
+    trace.event('package_save', 'failure', { reason: 'storage' }, { taskId: id });
+    return false;
+  }
+}
+
 // Auto-cleanup: delete completed files older than configured days
 export function runTimeCleanup() {
   const { autoCleanupDays } = config;
@@ -108,8 +145,7 @@ export function runTimeCleanup() {
   }
 
   for (const id of expiredIds) {
-    console.log(`[Cleanup] Deleting expired task: ${id}`);
-    deleteTask(id);
+    deleteCleanupTask(id);
   }
 }
 
@@ -138,9 +174,7 @@ export function runSpaceCleanup() {
 
   fileTasks.sort((a, b) => a.mtimeMs - b.mtimeMs);
   for (const ft of fileTasks) {
-    console.log(`[Cleanup] Space limit exceeded, deleting task: ${ft.id}`);
-    deleteTask(ft.id);
-    totalBytes -= ft.size;
+    if (deleteCleanupTask(ft.id)) totalBytes -= ft.size;
     if (totalBytes <= maxBytes) break;
   }
 }
@@ -154,8 +188,11 @@ function scheduleDailyCleanup() {
   }
 
   function tick() {
-    runTimeCleanup();
-    setTimeout(tick, msUntilMidnight());
+    try {
+      runTimeCleanup();
+    } finally {
+      setTimeout(tick, msUntilMidnight());
+    }
   }
 
   setTimeout(tick, msUntilMidnight());
@@ -245,7 +282,12 @@ function notifyProgress(task: DownloadTask) {
   const listeners = progressListeners.get(task.id);
   if (listeners) {
     for (const listener of listeners) {
-      listener(task);
+      try {
+        listener(task);
+      } catch {
+        // A disconnected progress observer cannot fail the download itself.
+        listeners.delete(listener);
+      }
     }
   }
 }
@@ -280,6 +322,9 @@ export function getTask(id: string): DownloadTask | undefined {
 export function deleteTask(id: string): boolean {
   const task = tasks.get(id);
   if (!task) return false;
+  const trace = taskTrace(task);
+  trace.event('task_cancel', 'start', {}, { taskId: task.id });
+  activeRuns.delete(id);
 
   // Abort if downloading
   const controller = abortControllers.get(id);
@@ -293,36 +338,57 @@ export function deleteTask(id: string): boolean {
     chunkDownloaders.delete(id);
   }
 
-  // Remove file if exists, with path safety check
-  if (task.filePath) {
-    const resolved = path.resolve(task.filePath);
-    const packagesBase = path.resolve(PACKAGES_DIR);
-    if (resolved.startsWith(packagesBase + path.sep) && fs.existsSync(resolved)) {
-      fs.unlinkSync(resolved);
+  try {
+    // Remove file if exists, with path safety check
+    if (task.filePath) {
+      const resolved = path.resolve(task.filePath);
+      const packagesBase = path.resolve(PACKAGES_DIR);
+      if (resolved.startsWith(packagesBase + path.sep) && fs.existsSync(resolved)) {
+        fs.unlinkSync(resolved);
 
-      // Clean up empty parent directories
-      let dir = path.dirname(resolved);
-      while (dir !== packagesBase && dir.startsWith(packagesBase)) {
-        const contents = fs.readdirSync(dir);
-        if (contents.length === 0) {
-          fs.rmdirSync(dir);
-          dir = path.dirname(dir);
-        } else {
-          break;
+        // Clean up empty parent directories
+        let dir = path.dirname(resolved);
+        while (dir !== packagesBase && dir.startsWith(packagesBase)) {
+          const contents = fs.readdirSync(dir);
+          if (contents.length === 0) {
+            fs.rmdirSync(dir);
+            dir = path.dirname(dir);
+          } else {
+            break;
+          }
         }
       }
     }
+  } catch {
+    // The old run is already invalidated. Keep a terminal, retryable task rather
+    // than a downloading/injecting task with no worker after a filesystem error.
+    task.error = 'Failed to delete download';
+    task.speed = '0 B/s';
+    setTaskState(task, 'failed', 'storage');
+    trace.event('task_cancel', 'failure', { reason: 'storage' }, { taskId: task.id, taskState: 'failed' });
+    try {
+      // Remove previously completed metadata when storage is still writable.
+      persistTasks();
+    } catch {
+      trace.event('package_save', 'failure', { reason: 'storage' }, { taskId: task.id, taskState: 'failed' });
+    }
+    notifyProgress(task);
+    throw new Error('Failed to delete download');
   }
 
   tasks.delete(id);
   progressListeners.delete(id);
+  taskDiagnostics.delete(id);
   persistTasks();
+  trace.event('task_cancel', 'cancelled', { reason: 'cancelled' }, { taskId: task.id, taskState: 'deleted' });
   return true;
 }
 
 export function pauseTask(id: string): boolean {
   const task = tasks.get(id);
   if (!task || task.status !== 'downloading') return false;
+  // Invalidate before abort: an old rejection must never mutate a resumed run.
+  activeRuns.delete(id);
 
   const controller = abortControllers.get(id);
   if (controller) {
@@ -335,7 +401,8 @@ export function pauseTask(id: string): boolean {
     chunkDownloaders.delete(id);
   }
 
-  task.status = 'paused';
+  setTaskState(task, 'paused', 'cancelled');
+  taskTrace(task).event('task_pause', 'success', {}, { taskId: task.id, taskState: 'paused' });
   notifyProgress(task);
   return true;
 }
@@ -343,7 +410,7 @@ export function pauseTask(id: string): boolean {
 export function resumeTask(id: string): boolean {
   const task = tasks.get(id);
   if (!task || task.status !== 'paused') return false;
-
+  taskTrace(task).event('task_resume', 'start', {}, { taskId: task.id });
   startDownload(task);
   return true;
 }
@@ -354,6 +421,7 @@ export function createTask(
   downloadURL: string,
   sinfs: Sinf[],
   iTunesMetadata?: string,
+  diagnostics?: ServerDiagnostic,
 ): DownloadTask {
   // Validate download URL
   validateDownloadURL(downloadURL);
@@ -377,108 +445,137 @@ export function createTask(
   };
 
   tasks.set(task.id, task);
+  taskDiagnostics.set(task.id, diagnostics ?? createServerDiagnostic('download'));
+  taskTrace(task).event('task_state', 'transition', {}, { taskId: task.id, taskState: 'pending' });
   startDownload(task);
   return task;
 }
 
-async function startDownload(task: DownloadTask) {
-  // Pre-download cleanup: expire old files + enforce space limit
-  runTimeCleanup();
-  runSpaceCleanup();
-
-  const controller = new AbortController();
-  abortControllers.set(task.id, controller);
-
-  // Set a global timeout for the entire download
-  const timeout = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
-
-  task.status = 'downloading';
-  task.progress = 0;
-  task.speed = '0 B/s';
-  task.error = undefined;
+function startDownload(task: DownloadTask) {
+  const run = Symbol('download-run');
+  const previous = runningJobs.get(task.id);
+  activeRuns.set(task.id, run);
+  // Resume becomes pending immediately, so a second resume cannot enqueue a
+  // second job while the aborted predecessor is still releasing file handles.
+  if (task.status !== 'pending') setTaskState(task, 'pending');
   notifyProgress(task);
+  const job = (async () => {
+    if (previous) await previous;
+    if (tasks.get(task.id) !== task || activeRuns.get(task.id) !== run) return;
+    await runDownload(task, run);
+  })();
+  runningJobs.set(task.id, job);
+  void job.finally(() => {
+    if (runningJobs.get(task.id) === job) runningJobs.delete(task.id);
+  });
+}
 
-  // Sanitize path segments
-  const safeAccountHash = safePathSegment(task.accountHash, 'accountHash');
-  const safeBundleID = safePathSegment(task.software.bundleID, 'bundleID');
-  const safeVersion = safePathSegment(task.software.version, 'version');
-
-  const dir = path.join(PACKAGES_DIR, safeAccountHash, safeBundleID, safeVersion);
-
-  // Verify the resolved path is within PACKAGES_DIR
-  const resolvedDir = path.resolve(dir);
-  const packagesBase = path.resolve(PACKAGES_DIR);
-  if (!resolvedDir.startsWith(packagesBase + path.sep)) {
-    task.status = 'failed';
-    task.error = 'Invalid path';
-    clearTimeout(timeout);
-    notifyProgress(task);
-    return;
-  }
-
-  fs.mkdirSync(dir, { recursive: true });
-
-  const filePath = path.join(dir, `${task.id}.ipa`);
-  task.filePath = filePath;
-
+async function runDownload(task: DownloadTask, run: symbol) {
+  const current = () => tasks.get(task.id) === task && activeRuns.get(task.id) === run;
+  const trace = taskTrace(task);
+  const controller = new AbortController();
+  let downloader: ChunkedDownloader | undefined;
+  let timedOut = false;
+  let filePath: string | undefined;
+  let stage: DiagnosticEvent['stage'] = 'package_save';
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, DOWNLOAD_TIMEOUT_MS);
+  abortControllers.set(task.id, controller);
   try {
-    // Re-validate download URL before fetching
+    runTimeCleanup();
+    runSpaceCleanup();
+    if (!current()) return;
+    setTaskState(task, 'downloading');
+    task.progress = 0;
+    task.speed = '0 B/s';
+    task.error = undefined;
+    notifyProgress(task);
+
+    const safeAccountHash = safePathSegment(task.accountHash, 'accountHash');
+    const safeBundleID = safePathSegment(task.software.bundleID, 'bundleID');
+    const safeVersion = safePathSegment(task.software.version, 'version');
+    const dir = path.join(PACKAGES_DIR, safeAccountHash, safeBundleID, safeVersion);
+    if (!path.resolve(dir).startsWith(path.resolve(PACKAGES_DIR) + path.sep)) throw new Error('Invalid path');
+    fs.mkdirSync(dir, { recursive: true });
+    filePath = path.join(dir, `${task.id}.ipa`);
+    task.filePath = filePath;
     validateDownloadURL(task.downloadURL);
 
-    const downloader = new ChunkedDownloader(task.downloadURL, filePath, {
+    stage = 'download_fetch';
+    trace.event(stage, 'start', { endpoint: 'backend_downloads' }, { taskId: task.id });
+    downloader = new ChunkedDownloader(task.downloadURL, filePath, {
+      onDiagnostic: (outcome, details) => {
+        if (current()) trace.event('download_fetch', outcome, details, { taskId: task.id });
+      },
       onProgress: (info) => {
+        if (!current() || controller.signal.aborted) return;
         task.speed = info.speed;
-        if (info.total > 0) {
-          task.progress = Math.round((info.downloaded / info.total) * 100);
-        }
+        if (info.total > 0) task.progress = Math.round((info.downloaded / info.total) * 100);
         notifyProgress(task);
       },
     });
     chunkDownloaders.set(task.id, downloader);
-
     await downloader.download(controller.signal);
+    if (!current() || controller.signal.aborted) {
+      if (current() && timedOut) throw new DOMException('Timed out', 'AbortError');
+      trace.event(stage, 'cancelled', { reason: 'cancelled' }, { taskId: task.id });
+      return;
+    }
+    trace.event(stage, 'success', {}, { taskId: task.id });
 
-    chunkDownloaders.delete(task.id);
-    abortControllers.delete(task.id);
-    clearTimeout(timeout);
-
-    // Inject sinfs
     if (task.sinfs.length > 0) {
-      task.status = 'injecting';
+      stage = 'ipa_compile';
+      setTaskState(task, 'injecting');
       task.progress = 100;
       notifyProgress(task);
-
+      trace.event(stage, 'start', {}, { taskId: task.id });
       await inject(task.sinfs, filePath, task.iTunesMetadata);
+      if (!current() || controller.signal.aborted) {
+        if (current() && timedOut) throw new DOMException('Timed out', 'AbortError');
+        trace.event(stage, 'cancelled', { reason: 'cancelled' }, { taskId: task.id });
+        return;
+      }
+      trace.event(stage, 'success', {}, { taskId: task.id });
     }
 
+    stage = 'package_save';
+    trace.event(stage, 'start', {}, { taskId: task.id });
     task.status = 'completed';
     task.progress = 100;
-
-    // Strip sensitive data after successful compile
+    task.speed = '0 B/s';
     task.downloadURL = '';
     task.sinfs = [];
     task.iTunesMetadata = undefined;
-
-    // Persist completed task metadata (no secrets)
     persistTasks();
+    trace.event(stage, 'success', {}, { taskId: task.id });
+    setTaskState(task, 'completed');
     notifyProgress(task);
-  } catch (err) {
-    chunkDownloaders.delete(task.id);
-    abortControllers.delete(task.id);
-    clearTimeout(timeout);
-
-    if (err instanceof Error && err.name === 'AbortError') {
-      // Status may have been changed to "paused" externally by pauseTask()
-      if ((task.status as string) === 'paused') return;
-      task.status = 'failed';
-      task.error = 'Download timed out';
-      notifyProgress(task);
+  } catch {
+    if (!current()) {
+      trace.event(stage, 'cancelled', { reason: 'cancelled' }, { taskId: task.id });
       return;
     }
-
-    task.status = 'failed';
-    console.error(`Download ${task.id} failed:`, err instanceof Error ? err.message : err);
-    task.error = 'Download failed';
+    const reason = timedOut ? 'timeout' : stage === 'package_save' ? 'storage' : 'network';
+    trace.event(stage, 'failure', { reason }, { taskId: task.id });
+    setTaskState(task, 'failed', reason);
+    task.error = timedOut ? 'Download timed out' : 'Download failed';
+    task.speed = '0 B/s';
     notifyProgress(task);
+  } finally {
+    clearTimeout(timeout);
+    // Cleanup belongs to this generation only. It cannot remove a new run's
+    // controller, or revive a task deleted while an async compiler was running.
+    if (abortControllers.get(task.id) === controller) abortControllers.delete(task.id);
+    if (downloader && chunkDownloaders.get(task.id) === downloader) chunkDownloaders.delete(task.id);
+    if (activeRuns.get(task.id) === run) activeRuns.delete(task.id);
+    if (tasks.get(task.id) !== task && filePath) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch {
+        /* Deleted or never created. */
+      }
+    }
   }
 }

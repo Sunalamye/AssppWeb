@@ -33,11 +33,36 @@ describe('device proof HTTP boundary', () => {
     expect(response.body.state).toBe('updated');
     expect(fetch).toHaveBeenCalledExactlyOnceWith('http://127.0.0.1:8081/v1/proof', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Asspp-Flow-Id': expect.any(String),
+        'X-Asspp-Request-Id': expect.any(String),
+      },
       body: JSON.stringify(input),
       signal: expect.any(AbortSignal),
       redirect: 'error',
     });
+  });
+
+  it('correlates safe request facts without logging proof values or browser credentials', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      Response.json({ headers: { 'X-Apple-AMD': 'private-proof' }, state: 'private-state' }),
+    );
+    const flowId = '34aa2f6d-56d3-4491-a24f-01fc597823c3';
+    const response = await request(app())
+      .post('/api/store-proof')
+      .set('X-Asspp-Flow-Id', flowId)
+      .set('Cookie', 'private-cookie')
+      .send(input);
+    expect(response.status).toBe(200);
+    expect(response.headers['x-asspp-flow-id']).toBe(flowId);
+    const lines = log.mock.calls.map(([line]) => JSON.parse(line));
+    expect(lines.some((line) => line.flowId === flowId && line.outcome === 'start')).toBe(true);
+    expect(lines.some((line) => line.flowId === flowId && line.outcome === 'success' && line.httpStatus === 200)).toBe(
+      true,
+    );
+    expect(JSON.stringify(lines)).not.toMatch(/private-|synthetic-machine-state|aabbccddeeff/);
   });
 
   it.each(['password', 'appleId', 'cookies', 'passwordToken', 'code', 'headers', 'body', 'callbackURL'])(

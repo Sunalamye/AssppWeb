@@ -1,13 +1,12 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { useParams, useLocation } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import PageContainer from '../Layout/PageContainer';
 import AppIcon from '../common/AppIcon';
 import { useAccounts } from '../../hooks/useAccounts';
 import { useDownloadAction } from '../../hooks/useDownloadAction';
+import { useActionGuard } from '../../hooks/useActionGuard';
 import { useToastStore } from '../../store/toast';
-import { listVersions } from '../../apple/versionFinder';
-import { getVersionMetadata } from '../../apple/versionLookup';
 import { getErrorMessage } from '../../utils/error';
 import { storeIdToCountry } from '../../apple/config';
 import type { Software, VersionMetadata } from '../../types';
@@ -15,16 +14,17 @@ import type { Software, VersionMetadata } from '../../types';
 export default function VersionHistory() {
   const { appId } = useParams<{ appId: string }>();
   const location = useLocation();
-  const { accounts, updateAccount } = useAccounts();
+  const { accounts } = useAccounts();
   const { t } = useTranslation();
   const addToast = useToastStore((s) => s.addToast);
-  const { startDownload, toastDownloadError } = useDownloadAction();
+  const { startDownload, loadVersions, loadVersionMetadata, toastDownloadError } = useDownloadAction();
+  const actionGuard = useActionGuard();
 
   const stateApp = (location.state as { app?: Software; country?: string })?.app;
   const stateCountry = (location.state as { country?: string })?.country;
   const country = stateCountry ?? 'US';
 
-  const [app] = useState<Software | null>(stateApp ?? null);
+  const app = stateApp ?? null;
   const [selectedAccount, setSelectedAccount] = useState('');
 
   const filteredAccounts = useMemo(
@@ -44,43 +44,54 @@ export default function VersionHistory() {
   }, [filteredAccounts, selectedAccount]);
 
   const account = filteredAccounts.find((a) => a.email === selectedAccount);
+  const selection = `${app?.id ?? appId}:${account?.email ?? ''}`;
+  const currentSelection = useRef(selection);
+  currentSelection.current = selection;
+  useEffect(() => {
+    setVersions([]);
+    setVersionMeta({});
+  }, [selection]);
 
   async function handleLoadVersions() {
     if (!account || !app) return;
+    if (!actionGuard.begin('versions')) return;
     setLoading(true);
     try {
-      const result = await listVersions(account, app);
-      setVersions(result.versions);
-      await updateAccount({ ...account, cookies: result.updatedCookies });
+      const result = await loadVersions(account, app);
+      if (currentSelection.current === selection) setVersions(result.versions);
     } catch (e) {
       addToast(getErrorMessage(e, t('search.versions.loadFailed')), 'error');
     } finally {
+      actionGuard.end();
       setLoading(false);
     }
   }
 
   async function handleLoadMeta(versionId: string) {
     if (!account || !app || versionMeta[versionId]) return;
+    if (!actionGuard.begin('versions')) return;
     setLoadingMeta((prev) => ({ ...prev, [versionId]: true }));
     try {
-      const result = await getVersionMetadata(account, app, versionId);
-      setVersionMeta((prev) => ({ ...prev, [versionId]: result.metadata }));
-      await updateAccount({ ...account, cookies: result.updatedCookies });
-    } catch {
-      // Silently fail for individual version metadata
+      const result = await loadVersionMetadata(account, app, versionId);
+      if (currentSelection.current === selection) setVersionMeta((prev) => ({ ...prev, [versionId]: result.metadata }));
+    } catch (error) {
+      addToast(getErrorMessage(error, t('search.versions.loadFailed')), 'error');
     } finally {
+      actionGuard.end();
       setLoadingMeta((prev) => ({ ...prev, [versionId]: false }));
     }
   }
 
   async function handleDownloadVersion(versionId: string) {
     if (!account || !app) return;
+    if (!actionGuard.begin('download')) return;
     setDownloadingVersion(versionId);
     try {
       await startDownload(account, app, versionId);
     } catch (e) {
       toastDownloadError(account, app, e);
     } finally {
+      actionGuard.end();
       setDownloadingVersion(null);
     }
   }
@@ -120,6 +131,7 @@ export default function VersionHistory() {
                 <select
                   value={selectedAccount}
                   onChange={(e) => setSelectedAccount(e.target.value)}
+                  disabled={loading || Object.values(loadingMeta).some(Boolean) || downloadingVersion !== null}
                   className="w-full min-w-0 rounded-md border border-gray-300 bg-white px-3 py-2 text-base text-gray-900 transition-colors focus:border-blue-500 focus:ring-1 focus:ring-blue-500 dark:border-gray-700 dark:bg-gray-800 dark:text-white"
                 >
                   {filteredAccounts.map((a) => (

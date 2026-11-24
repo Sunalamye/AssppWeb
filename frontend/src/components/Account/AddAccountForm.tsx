@@ -1,14 +1,18 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import PageContainer from '../Layout/PageContainer';
 import Spinner from '../common/Spinner';
 import { useAccounts } from '../../hooks/useAccounts';
+import { useActionGuard } from '../../hooks/useActionGuard';
 import { useToastStore } from '../../store/toast';
 import { Authenticator, AuthenticationError } from '../../apple/authenticate';
 import { getErrorMessage } from '../../utils/error';
+import { withAccountAction } from '../../utils/accountActions';
+import { attachDiagnosticId, createDiagnosticFlow, errorDiagnosticDetails } from '../../utils/diagnostics';
 import { generateDeviceId } from '../../apple/config';
 import type { AuthPhase, AuthRetry } from '../../apple/authenticate';
+import type { DiagnosticFlow } from '../../utils/diagnostics';
 
 export default function AddAccountForm() {
   const navigate = useNavigate();
@@ -22,6 +26,15 @@ export default function AddAccountForm() {
   const [deviceId, setDeviceId] = useState(() => generateDeviceId());
   const [needsCode, setNeedsCode] = useState(false);
   const authenticator = useRef<Authenticator | null>(null);
+  const loginFlow = useRef<DiagnosticFlow | null>(null);
+  const mounted = useRef(true);
+  const actionGuard = useActionGuard();
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   const [loading, setLoading] = useState(false);
   const [retry, setRetry] = useState<AuthRetry | null>(null);
   const [phase, setPhase] = useState<AuthPhase | null>(null);
@@ -30,38 +43,66 @@ export default function AddAccountForm() {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (!actionGuard.begin('login')) return;
+    const flow = (loginFlow.current ??= createDiagnosticFlow('login'));
+    flow.log('action', 'start');
     setLoading(true);
 
     try {
       const cleanedDeviceId = deviceId.replace(/[: ]/g, '');
       setDeviceId(cleanedDeviceId);
 
-      if (!needsCode || !authenticator.current) authenticator.current = new Authenticator(cleanedDeviceId);
-      const account = await authenticator.current.authenticate(
-        email,
-        password,
-        needsCode && code ? code : undefined,
-        setRetry,
-        setPhase,
-      );
-      await addAccount(account);
+      await withAccountAction(email, flow, async () => {
+        if (!needsCode || !authenticator.current) authenticator.current = new Authenticator(cleanedDeviceId, [], flow);
+        const account = await authenticator.current.authenticate(
+          email,
+          password,
+          needsCode ? code : undefined,
+          setRetry,
+          setPhase,
+          flow,
+        );
+        if (!mounted.current) throw new DOMException('The sign-in view was closed.', 'AbortError');
+        await addAccount(account, flow);
+      });
+      flow.log('action', 'success');
+      authenticator.current = null;
+      loginFlow.current = null;
       addToast(t('accounts.addForm.addSuccess'), 'success');
       navigate('/accounts');
     } catch (err) {
+      attachDiagnosticId(err, flow.id);
+      if (!mounted.current) {
+        flow.log('action', 'cancelled', { reason: 'cancelled' });
+        return;
+      }
       if (err instanceof AuthenticationError && err.codeRequired) {
+        flow.log('verification', 'transition', { codeRequired: true, reason: 'verification_required' });
         setNeedsCode(true);
-        addToast(err.message, 'error');
+        addToast(getErrorMessage(err, t('accounts.addForm.authFailed')), 'error');
       } else {
+        flow.log('action', 'failure', errorDiagnosticDetails(err));
         setNeedsCode(false);
         setCode('');
         authenticator.current = null;
+        loginFlow.current = null;
         addToast(getErrorMessage(err, t('accounts.addForm.authFailed')), 'error');
       }
     } finally {
+      actionGuard.end();
+      if (!mounted.current) return;
       setRetry(null);
       setPhase(null);
       setLoading(false);
     }
+  }
+
+  function resetContinuation() {
+    loginFlow.current?.log('action', 'cancelled', { reason: 'cancelled' });
+    loginFlow.current = null;
+    authenticator.current = null;
+    setNeedsCode(false);
+    setCode('');
   }
 
   return (
@@ -80,9 +121,7 @@ export default function AddAccountForm() {
                 value={email}
                 onChange={(e) => {
                   setEmail(e.target.value);
-                  setNeedsCode(false);
-                  setCode('');
-                  authenticator.current = null;
+                  resetContinuation();
                 }}
                 disabled={loading}
                 placeholder={t('accounts.addForm.emailPlaceholder')}
@@ -101,9 +140,7 @@ export default function AddAccountForm() {
                 value={password}
                 onChange={(e) => {
                   setPassword(e.target.value);
-                  setNeedsCode(false);
-                  setCode('');
-                  authenticator.current = null;
+                  resetContinuation();
                 }}
                 disabled={loading}
                 className={inputClassName}
@@ -171,7 +208,10 @@ export default function AddAccountForm() {
             </button>
             <button
               type="button"
-              onClick={() => navigate('/accounts')}
+              onClick={() => {
+                resetContinuation();
+                navigate('/accounts');
+              }}
               disabled={loading}
               className="min-h-11 rounded-full bg-gray-200 px-6 py-2.5 text-sm font-semibold text-gray-700 transition-colors hover:bg-gray-300 disabled:opacity-50 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
             >

@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import { observeRequest } from '../utils/diagnostics.js';
 
 const router = Router();
 
@@ -27,19 +28,21 @@ function mapSoftware(item: Record<string, any>) {
 }
 
 router.get('/search', async (req: Request, res: Response) => {
+  const trace = observeRequest(req, res, 'download', 'action', 'public_version');
   try {
     const params = new URLSearchParams(req.query as Record<string, string>);
     const response = await fetch(`https://itunes.apple.com/search?${params.toString()}`);
     const data = await response.json();
     const results = (data.results ?? []).map(mapSoftware);
     res.json(results);
-  } catch (err) {
-    console.error('Search error:', err instanceof Error ? err.message : err);
+  } catch {
+    trace.result({ reason: 'network' });
     res.status(500).json({ error: 'Search request failed' });
   }
 });
 
 router.get('/lookup', async (req: Request, res: Response) => {
+  const trace = observeRequest(req, res, 'download', 'action', 'public_version');
   try {
     const params = new URLSearchParams(req.query as Record<string, string>);
     const response = await fetch(`https://itunes.apple.com/lookup?${params.toString()}`);
@@ -49,8 +52,8 @@ router.get('/lookup', async (req: Request, res: Response) => {
       return;
     }
     res.json(mapSoftware(data.results[0]));
-  } catch (err) {
-    console.error('Lookup error:', err instanceof Error ? err.message : err);
+  } catch {
+    trace.result({ reason: 'network' });
     res.status(500).json({ error: 'Lookup request failed' });
   }
 });

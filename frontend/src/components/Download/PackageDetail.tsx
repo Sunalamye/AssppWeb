@@ -10,12 +10,19 @@ import PackageQuickActions from './PackageQuickActions';
 import { isDownloadPreviewEnabled, isPreviewDownloadTask, previewDownloadTasks } from './previewTasks';
 import { useAccounts } from '../../hooks/useAccounts';
 import { useDownloadAction } from '../../hooks/useDownloadAction';
+import { useActionGuard } from '../../hooks/useActionGuard';
 import { useDownloads } from '../../hooks/useDownloads';
 import { useToastStore } from '../../store/toast';
-import { listVersions } from '../../apple/versionFinder';
 import { lookupApp } from '../../api/search';
 import { formatBytes } from '../../utils/format';
 import { getAccountContext } from '../../utils/toast';
+import { getErrorMessage } from '../../utils/error';
+import {
+  attachDiagnosticId,
+  createDiagnosticFlow,
+  errorDiagnosticDetails,
+  getDiagnosticId,
+} from '../../utils/diagnostics';
 import { isNewerVersion } from '../../utils/version';
 import { storeIdToCountry } from '../../apple/config';
 import type { Software } from '../../types';
@@ -27,7 +34,8 @@ export default function PackageDetail() {
   const { t } = useTranslation();
   const { tasks, deleteDownload, pauseDownload, resumeDownload, hashToEmail } = useDownloads();
   const { accounts } = useAccounts();
-  const { startDownload } = useDownloadAction();
+  const { startDownload, loadVersions } = useDownloadAction();
+  const actionGuard = useActionGuard();
   const addToast = useToastStore((state) => state.addToast);
 
   const [checkingUpdate, setCheckingUpdate] = useState(false);
@@ -73,26 +81,38 @@ export default function PackageDetail() {
     }
     if (!confirm(t('downloads.package.deleteConfirm'))) return;
 
-    await deleteDownload(taskId);
-    const context = getAccountContext(account, t);
-    addToast(t('toast.msg', { appName, ...context }), 'success', t('toast.title.deleteSuccess'));
-    navigate('/downloads');
+    try {
+      await deleteDownload(taskId);
+      const context = getAccountContext(account, t);
+      addToast(t('toast.msg', { appName, ...context }), 'success', t('toast.title.deleteSuccess'));
+      navigate('/downloads');
+    } catch (error) {
+      addToast(getErrorMessage(error, t('toast.title.downloadFailed')), 'error');
+    }
   }
 
-  function handlePause() {
+  async function handlePause() {
     if (isPreview) {
       showPreviewNotice();
       return;
     }
-    pauseDownload(taskId);
+    try {
+      await pauseDownload(taskId);
+    } catch (error) {
+      addToast(getErrorMessage(error, t('toast.title.downloadFailed')), 'error');
+    }
   }
 
-  function handleResume() {
+  async function handleResume() {
     if (isPreview) {
       showPreviewNotice();
       return;
     }
-    resumeDownload(taskId);
+    try {
+      await resumeDownload(taskId);
+    } catch (error) {
+      addToast(getErrorMessage(error, t('toast.title.downloadFailed')), 'error');
+    }
   }
 
   async function handleCheckUpdate() {
@@ -101,39 +121,54 @@ export default function PackageDetail() {
       return;
     }
     if (!account) return;
+    if (!actionGuard.begin('versions')) return;
+    const flow = createDiagnosticFlow('versions');
+    flow.log('version_lookup', 'start', { endpoint: 'public_version' });
 
     setCheckingUpdate(true);
     try {
       const country = storeIdToCountry(account.store) ?? 'US';
       const app = await lookupApp(bundleID, country);
+      flow.log('version_lookup', 'success');
 
       if (app && isNewerVersion(app.version, currentVersion)) {
         setLatestApp(app);
-        const result = await listVersions(account, app);
+        const result = await loadVersions(account, app);
         setAvailableVersions(result.versions);
         setSelectedVersion(result.versions[0] || '');
         setShowUpdateModal(true);
       } else {
         addToast(t('downloads.package.noUpdate'), 'info');
       }
-    } catch {
-      addToast(t('downloads.package.checkUpdateFailed'), 'error');
+    } catch (error) {
+      flow.log('version_lookup', 'failure', errorDiagnosticDetails(error));
+      addToast(
+        getErrorMessage(
+          getDiagnosticId(error) ? error : attachDiagnosticId(error, flow.id),
+          t('downloads.package.checkUpdateFailed'),
+        ),
+        'error',
+      );
     } finally {
+      actionGuard.end();
       setCheckingUpdate(false);
     }
   }
 
   async function handleConfirmUpdate() {
     if (!account || !latestApp) return;
+    if (!actionGuard.begin('download')) return;
 
     setShowUpdateModal(false);
     try {
       const isLatest = availableVersions.length > 0 && selectedVersion === availableVersions[0];
-      await startDownload(account, latestApp, isLatest ? undefined : selectedVersion);
-      await deleteDownload(taskId);
+      if ((await startDownload(account, latestApp, isLatest ? undefined : selectedVersion)) === false) return;
+      // Enqueue success does not guarantee a usable replacement IPA. Preserve the old file.
       navigate('/downloads');
-    } catch {
-      addToast(t('downloads.package.updateFailed'), 'error');
+    } catch (error) {
+      addToast(getErrorMessage(error, t('downloads.package.updateFailed')), 'error');
+    } finally {
+      actionGuard.end();
     }
   }
 

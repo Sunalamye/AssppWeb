@@ -3,6 +3,7 @@ import path from 'path';
 import { pipeline } from 'stream/promises';
 import { Readable } from 'stream';
 import { DOWNLOAD_THREADS, CHUNK_RETRY_COUNT, CHUNK_RETRY_DELAY_MS, MAX_DOWNLOAD_SIZE } from '../config.js';
+import type { DiagnosticDetails, DiagnosticEvent } from '../utils/diagnostics.js';
 
 interface ChunkRange {
   index: number;
@@ -27,6 +28,7 @@ export class ChunkedDownloader {
   private readonly destPath: string;
   private readonly threads: number;
   private readonly onProgress?: ProgressCallback;
+  private readonly onDiagnostic?: (outcome: DiagnosticEvent['outcome'], details: DiagnosticDetails) => void;
 
   private abortControllers = new Set<AbortController>();
   private aborted = false;
@@ -35,11 +37,28 @@ export class ChunkedDownloader {
   private lastProgressTime = 0;
   private lastProgressBytes = 0;
 
-  constructor(url: string, destPath: string, options?: { threads?: number; onProgress?: ProgressCallback }) {
+  constructor(
+    url: string,
+    destPath: string,
+    options?: {
+      threads?: number;
+      onProgress?: ProgressCallback;
+      onDiagnostic?: (outcome: DiagnosticEvent['outcome'], details: DiagnosticDetails) => void;
+    },
+  ) {
     this.url = url;
     this.destPath = destPath;
     this.threads = options?.threads ?? DOWNLOAD_THREADS;
     this.onProgress = options?.onProgress;
+    this.onDiagnostic = options?.onDiagnostic;
+  }
+
+  private diagnostic(outcome: DiagnosticEvent['outcome'], details: DiagnosticDetails) {
+    try {
+      this.onDiagnostic?.(outcome, details);
+    } catch {
+      /* Observers cannot change download behavior. */
+    }
   }
 
   /** Probe the server for Range support and content length. */
@@ -53,6 +72,7 @@ export class ChunkedDownloader {
       redirect: 'follow',
     });
     if (!res.ok) {
+      this.diagnostic('failure', { httpStatus: res.status, reason: 'http_error' });
       throw new Error(`HEAD failed: HTTP ${res.status}`);
     }
 
@@ -83,7 +103,7 @@ export class ChunkedDownloader {
     let lastErr: Error | undefined;
 
     for (let attempt = 0; attempt < CHUNK_RETRY_COUNT; attempt++) {
-      if (this.aborted) throw new Error('Aborted');
+      if (this.aborted || signal.aborted) throw new DOMException('Aborted', 'AbortError');
 
       const ac = new AbortController();
       this.abortControllers.add(ac);
@@ -137,6 +157,7 @@ export class ChunkedDownloader {
         lastErr = err instanceof Error ? err : new Error(String(err));
         if (lastErr.name === 'AbortError' || this.aborted) throw lastErr;
         if (attempt < CHUNK_RETRY_COUNT - 1) {
+          this.diagnostic('retry', { attempt: attempt + 2, retryDelayMs: CHUNK_RETRY_DELAY_MS, reason: 'network' });
           await new Promise((r) => setTimeout(r, CHUNK_RETRY_DELAY_MS));
         }
       } finally {
@@ -246,6 +267,7 @@ export class ChunkedDownloader {
    * or falls back to single-stream.
    */
   async download(signal: AbortSignal): Promise<void> {
+    if (this.aborted || signal.aborted) throw new DOMException('Aborted', 'AbortError');
     let supportsRange = false;
     let contentLength = 0;
     try {
@@ -253,7 +275,9 @@ export class ChunkedDownloader {
       supportsRange = probeResult.supportsRange;
       contentLength = probeResult.contentLength;
     } catch {
+      if (this.aborted || signal.aborted) throw new DOMException('Aborted', 'AbortError');
       // HEAD failed — fall back to single-stream
+      this.diagnostic('transition', { reason: 'fallback' });
     }
 
     if (contentLength > MAX_DOWNLOAD_SIZE) {
@@ -291,8 +315,9 @@ export class ChunkedDownloader {
       });
     }, 500);
 
+    const pendingChunks = chunks.map((chunk) => this.downloadChunk(chunk, signal));
     try {
-      await Promise.all(chunks.map((chunk) => this.downloadChunk(chunk, signal)));
+      await Promise.all(pendingChunks);
 
       clearInterval(progressInterval);
       await this.mergeChunks(chunks.length);
@@ -304,6 +329,10 @@ export class ChunkedDownloader {
       });
     } catch (err) {
       clearInterval(progressInterval);
+      // Promise.all rejects on the first failure. Stop and settle every writer
+      // before cleanup or a resumed task reuses these same .part paths.
+      this.abort();
+      await Promise.allSettled(pendingChunks);
       this.cleanPartFiles(chunks.length);
       throw err;
     }

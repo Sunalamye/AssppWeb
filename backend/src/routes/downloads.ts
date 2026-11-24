@@ -13,13 +13,32 @@ import {
   validateDownloadURL,
 } from '../services/downloadManager.js';
 import { getIdParam, requireAccountHash, verifyTaskOwnership } from '../utils/route.js';
+import { observeRequest } from '../utils/diagnostics.js';
+import type { DiagnosticEvent, ServerDiagnostic } from '../utils/diagnostics.js';
 
 const router = Router();
 
-async function fetchDownloadSizeBytes(downloadURL: string): Promise<number | null> {
+router.use((req, res, next) => {
+  if (!/^\/downloads(?:\/|$)/.test(req.path)) return next();
+  const stage: DiagnosticEvent['stage'] =
+    req.method === 'POST' && req.path === '/downloads'
+      ? 'download_enqueue'
+      : req.path.endsWith('/pause')
+        ? 'task_pause'
+        : req.path.endsWith('/resume')
+          ? 'task_resume'
+          : req.method === 'DELETE'
+            ? 'task_cancel'
+            : 'task_state';
+  res.locals.downloadDiagnostic = observeRequest(req, res, 'download', stage, 'backend_downloads');
+  next();
+});
+
+async function fetchDownloadSizeBytes(downloadURL: string, signal: AbortSignal): Promise<number | null> {
   const headResponse = await fetch(downloadURL, {
     method: 'HEAD',
     redirect: 'follow',
+    signal,
   });
   if (!headResponse.ok) {
     throw new Error(`HEAD failed: HTTP ${headResponse.status}`);
@@ -34,6 +53,7 @@ async function fetchDownloadSizeBytes(downloadURL: string): Promise<number | nul
     method: 'GET',
     headers: { Range: 'bytes=0-0' },
     redirect: 'follow',
+    signal,
   });
   try {
     if (rangeResponse.status !== 206 && rangeResponse.status !== 200) {
@@ -66,9 +86,20 @@ async function fetchDownloadSizeBytes(downloadURL: string): Promise<number | nul
 
 // Start a new download
 router.post('/downloads', async (req: Request, res: Response) => {
-  const { software, accountHash, downloadURL, sinfs, iTunesMetadata } = req.body;
+  const trace = res.locals.downloadDiagnostic as ServerDiagnostic;
+  const { software, accountHash, downloadURL, sinfs, iTunesMetadata } = req.body || {};
 
-  if (!software || !accountHash || !downloadURL || !sinfs) {
+  if (
+    !software ||
+    typeof software !== 'object' ||
+    Array.isArray(software) ||
+    typeof accountHash !== 'string' ||
+    !accountHash ||
+    typeof downloadURL !== 'string' ||
+    !downloadURL ||
+    !Array.isArray(sinfs)
+  ) {
+    trace.result({ reason: 'invalid_request' });
     res.status(400).json({
       error: 'Missing required fields: software, accountHash, downloadURL, sinfs',
     });
@@ -79,6 +110,7 @@ router.post('/downloads', async (req: Request, res: Response) => {
   try {
     validateDownloadURL(downloadURL);
   } catch (err) {
+    trace.result({ reason: 'invalid_request' });
     res.status(400).json({
       error: err instanceof Error ? err.message : 'Invalid download URL',
     });
@@ -86,9 +118,19 @@ router.post('/downloads', async (req: Request, res: Response) => {
   }
 
   if (config.maxDownloadMB > 0) {
+    const controller = new AbortController();
+    const onClose = () => {
+      if (!res.writableEnded) controller.abort();
+    };
+    res.on('close', onClose);
     try {
-      const fileSizeBytes = await fetchDownloadSizeBytes(downloadURL);
+      const fileSizeBytes = await fetchDownloadSizeBytes(
+        downloadURL,
+        AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]),
+      );
+      if (res.destroyed) return;
       if (!fileSizeBytes) {
+        trace.result({ reason: 'invalid_response' });
         res.status(400).json({
           error: 'Unable to verify file size from Apple',
         });
@@ -96,23 +138,27 @@ router.post('/downloads', async (req: Request, res: Response) => {
       }
       const sizeMB = fileSizeBytes / (1024 * 1024);
       if (sizeMB > config.maxDownloadMB) {
+        trace.result({ reason: 'unsupported' });
         res.status(413).json({
           error: `File size exceeds the maximum limit of ${config.maxDownloadMB} MB`,
         });
         return;
       }
-    } catch (err) {
-      console.error('Apple size probe error:', err instanceof Error ? err.message : err);
-      res.status(502).json({ error: 'Failed to verify file size from Apple' });
+    } catch {
+      trace.result({ reason: 'network' });
+      if (!res.destroyed) res.status(502).json({ error: 'Failed to verify file size from Apple' });
       return;
+    } finally {
+      res.off('close', onClose);
     }
   }
 
   try {
-    const task = createTask(software, accountHash, downloadURL, sinfs, iTunesMetadata);
+    const task = createTask(software, accountHash, downloadURL, sinfs, iTunesMetadata, trace);
+    trace.event('download_enqueue', 'transition', {}, { taskId: task.id, taskState: task.status });
     res.status(201).json(sanitizeTaskForResponse(task));
-  } catch (err) {
-    console.error('Create download error:', err instanceof Error ? err.message : err);
+  } catch {
+    trace.result({ reason: 'invalid_request' });
     res.status(400).json({ error: 'Failed to create download' });
   }
 });

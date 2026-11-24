@@ -286,13 +286,21 @@
       "conflictOverwrite": "覆蓋本機",
       "conflictSkip": "保留本機 (僅新增新帳號)",
       "cleared": "所有本機資料已清空",
-      "clearFailed": "無法清除本機資料。請關閉其他分頁後再試一次。"
+      "clearFailed": "無法清除本機資料。請關閉其他分頁後再試一次。",
+      "importFailed": "帳號匯入失敗，請重試。",
+      "closeOtherTabs": "其他分頁仍在使用資料，請關閉此網站的其他分頁以完成清除。"
     },
     "about": {
       "title": "關於",
       "description": "Asspp Web —— Apple 應用程式與授權管理。",
       "buildCommit": "構建提交",
       "buildDate": "構建日期"
+    },
+    "diagnostics": {
+      "title": "診斷紀錄",
+      "description": "記錄登入、授權及下載的步驟與結果，並同步至服務日誌。最近 200 筆可匯出供排查；不包含帳密、Cookie、Token 或裝置驗證資料。",
+      "export": "匯出診斷紀錄",
+      "empty": "目前沒有診斷紀錄。"
     }
   },
   "countries": {
@@ -445,7 +453,8 @@
       "noSinf": "回應中找不到 sinf",
       "tooManyRedirects": "重新導向次數過多",
       "versionLookupFailed": "無法查詢帳號所在商店的最新 iOS 版本，請確認應用在該地區可用。",
-      "unexpectedItem": "Apple 回傳的應用或版本與請求不符，已停止下載。"
+      "unexpectedItem": "Apple 回傳的應用或版本與請求不符，已停止下載。",
+      "enqueueUncertain": "無法確認下載是否已建立，請先檢查下載清單再重試。"
     },
     "purchase": {
       "paidNotSupported": "不支援購買付費應用程式",
@@ -455,7 +464,12 @@
       "termsRequired": "您必須接受條款與約定：{{url}}",
       "failed": "購買失敗：{{failureType}}",
       "failedGeneral": "購買應用程式失敗",
-      "unknownError": "發生未知錯誤"
+      "unknownError": "發生未知錯誤",
+      "verificationRequired": "Apple 要求雙重驗證。請到帳號頁重新認證並完成驗證碼，再取得授權。",
+      "deviceVerificationFailed": "Apple 無法驗證這部裝置。請到帳號頁重新認證，再取得授權。",
+      "termsRequiredOnDevice": "Apple 要求接受 App Store 條款。請使用同一個 Apple 帳號開啟 App Store，完成條款確認後再試。",
+      "httpFailure": "Apple 購買請求失敗（HTTP {{status}}）。",
+      "invalidResponse": "無法判讀 Apple 的購買回應（HTTP {{status}}）。"
     },
     "auth": {
       "requiresVerification": "驗證需要雙重認證代碼。如果沒有彈出驗證碼，請嘗試在 https://account.apple.com 登入以觸發提示，然後在雙重認證代碼欄位中填寫該代碼。",
@@ -466,6 +480,11 @@
       "unknownReason": "未知原因導致認證失敗",
       "transientFailure": "認證失敗：嘗試 {{attempts}} 次後 Apple 仍未回應（HTTP {{statuses}}），請稍後再試。",
       "retryLater": "認證失敗：Apple 要求等待 {{seconds}} 秒後再試，請稍後再試。"
+    },
+    "account": {
+      "busy": "此帳號有其他操作進行中，請完成後再試。",
+      "clearing": "正在清除本機資料，請稍候。",
+      "missing": "帳號已不存在，請重新新增。"
     }
   },
   "toast": {

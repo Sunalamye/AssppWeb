@@ -243,6 +243,21 @@ describe('Apple download and version recovery', () => {
     expect((await listVersions(account, app)).versions).toEqual(['891730218', '100']);
   });
 
+  it.each([
+    { identifiers: ['100', 'not-a-version'] },
+    { identifiers: ['100', '0'] },
+    { identifiers: ['100', null] },
+    { identifiers: ['100', {}] },
+    { identifiers: [Number.MAX_SAFE_INTEGER + 1] },
+  ])(
+    'rejects invalid version-list identifiers instead of offering an unusable version: %j',
+    async ({ identifiers }) => {
+      vi.mocked(appleRequest).mockResolvedValue(success({ softwareVersionExternalIdentifiers: identifiers }));
+      await expect(listVersions(account, app)).rejects.toThrow(/Invalid version identifiers|invalid plist/);
+      expect(appleRequest).toHaveBeenCalledOnce();
+    },
+  );
+
   it('recovers the display metadata for the exact historical version', async () => {
     vi.mocked(appleRequest)
       .mockResolvedValueOnce(plist({}))

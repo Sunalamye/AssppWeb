@@ -93,6 +93,16 @@ Native jobs are serialized and have a 90-second request budget. A retained
 provisioning VM has an independent two-minute lifetime so it survives completion
 of the start HTTP request. Expired runtimes are cancelled and closed.
 
+The helper emits structured `asspp.diagnostic` events with `source: "helper"`.
+Only validated UUID correlation headers (`X-Asspp-Flow-Id` and the backend's
+`X-Asspp-Request-Id`), fixed stage/outcome categories, timing, and safe numeric
+HTTP status are included. Queue waits, bootstrap fallback, pending expiry, and
+completion are observable. Request bodies, device identifiers, DSIDs, proof
+headers, pending handles, and native error text are never logged. A recognized
+upstream machine-provisioning HTTP error contributes only its three-digit status.
+Native results returned after cancellation or provisioning expiry cannot become
+successful API responses.
+
 ## Build and cache preparation
 
 The Docker build clones the pinned upstream revision, copies this directory to

@@ -44,11 +44,11 @@ function escapeXml(s: string): string {
 export function parsePlist(xml: string): any {
   const doc = new DOMParser().parseFromString(xml, 'text/xml');
   const root = doc.documentElement;
-  if (root.nodeName !== 'plist') {
+  if (root.nodeName !== 'plist' || doc.getElementsByTagName('parsererror').length) {
     throw new Error('Invalid plist: root element is not <plist>');
   }
   const firstChild = root.firstElementChild;
-  if (!firstChild) {
+  if (!firstChild || root.children.length !== 1) {
     throw new Error('Invalid plist: empty <plist> element');
   }
   return parseNode(firstChild);
@@ -59,11 +59,14 @@ function parseNode(node: Element): any {
     case 'dict': {
       const result: Record<string, any> = {};
       const children = Array.from(node.children);
+      if (children.length % 2 !== 0) throw new Error('Invalid plist dictionary');
       for (let i = 0; i < children.length; i += 2) {
-        if (children[i].nodeName !== 'key') continue;
+        if (children[i].nodeName !== 'key') throw new Error('Invalid plist dictionary key');
         const key = children[i].textContent || '';
-        const value = i + 1 < children.length ? parseNode(children[i + 1]) : null;
-        result[key] = value;
+        if (Object.prototype.hasOwnProperty.call(result, key)) throw new Error('Duplicate plist dictionary key');
+        const value = parseNode(children[i + 1]);
+        // A plist key must not change the dictionary's prototype.
+        Object.defineProperty(result, key, { value, enumerable: true, configurable: true, writable: true });
       }
       return result;
     }
@@ -71,10 +74,18 @@ function parseNode(node: Element): any {
       return Array.from(node.children).map(parseNode);
     case 'string':
       return node.textContent || '';
-    case 'integer':
-      return parseInt(node.textContent || '0', 10);
-    case 'real':
-      return parseFloat(node.textContent || '0');
+    case 'integer': {
+      const raw = (node.textContent || '').trim();
+      if (!/^[+-]?\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw new Error('Invalid plist integer');
+      return Number(raw);
+    }
+    case 'real': {
+      const raw = (node.textContent || '').trim();
+      if (!/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(raw) || !Number.isFinite(Number(raw))) {
+        throw new Error('Invalid plist real');
+      }
+      return Number(raw);
+    }
     case 'true':
       return true;
     case 'false':

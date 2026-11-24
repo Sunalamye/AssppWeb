@@ -10,9 +10,17 @@ import { isDownloadPreviewEnabled, isPreviewDownloadTask, previewDownloadTasks }
 import { useDownloads } from '../../hooks/useDownloads';
 import { useAccounts } from '../../hooks/useAccounts';
 import { useDownloadAction } from '../../hooks/useDownloadAction';
+import { useActionGuard } from '../../hooks/useActionGuard';
 import { useToastStore } from '../../store/toast';
 import { lookupApp } from '../../api/search';
 import { getAccountContext } from '../../utils/toast';
+import { getErrorMessage } from '../../utils/error';
+import {
+  attachDiagnosticId,
+  createDiagnosticFlow,
+  errorDiagnosticDetails,
+  getDiagnosticId,
+} from '../../utils/diagnostics';
 import { isNewerVersion } from '../../utils/version';
 import { storeIdToCountry } from '../../apple/config';
 import type { DownloadTask } from '../../types';
@@ -29,6 +37,7 @@ export default function DownloadList() {
   const addToast = useToastStore((s) => s.addToast);
   const { accounts } = useAccounts();
   const { startDownload } = useDownloadAction();
+  const updateGuard = useActionGuard();
   const previewEnabled = isDownloadPreviewEnabled(location.search);
   const displayTasks = previewEnabled ? previewDownloadTasks : tasks;
 
@@ -54,7 +63,7 @@ export default function DownloadList() {
     return timeB - timeA;
   });
 
-  function handleDelete(id: string) {
+  async function handleDelete(id: string) {
     const task = displayTasks.find((item) => item.id === id);
     if (task && isPreviewDownloadTask(task)) {
       showPreviewNotice();
@@ -63,40 +72,49 @@ export default function DownloadList() {
 
     if (!confirm(t('downloads.deleteConfirm'))) return;
 
-    if (task) {
-      const accountEmail = hashToEmail[task.accountHash];
-      const account = accounts.find((a) => a.email === accountEmail);
-      const ctx = getAccountContext(account, t);
-
-      addToast(t('toast.msg', { appName: task.software.name, ...ctx }), 'success', t('toast.title.deleteSuccess'));
+    try {
+      await deleteDownload(id);
+      if (task) {
+        const accountEmail = hashToEmail[task.accountHash];
+        const account = accounts.find((a) => a.email === accountEmail);
+        const ctx = getAccountContext(account, t);
+        addToast(t('toast.msg', { appName: task.software.name, ...ctx }), 'success', t('toast.title.deleteSuccess'));
+      }
+    } catch (error) {
+      addToast(getErrorMessage(error, t('toast.title.downloadFailed')), 'error');
     }
-
-    deleteDownload(id);
   }
 
   function showPreviewNotice() {
     addToast(t('downloads.preview.actionHint'), 'info', t('downloads.preview.badge'));
   }
 
-  function handlePause(id: string) {
+  async function handlePause(id: string) {
     if (previewEnabled) {
       showPreviewNotice();
       return;
     }
-    pauseDownload(id);
+    try {
+      await pauseDownload(id);
+    } catch (error) {
+      addToast(getErrorMessage(error, t('toast.title.downloadFailed')), 'error');
+    }
   }
 
-  function handleResume(id: string) {
+  async function handleResume(id: string) {
     if (previewEnabled) {
       showPreviewNotice();
       return;
     }
-    resumeDownload(id);
+    try {
+      await resumeDownload(id);
+    } catch (error) {
+      addToast(getErrorMessage(error, t('toast.title.downloadFailed')), 'error');
+    }
   }
 
   function handleCancelCheck() {
     cancelCheckRef.current = true;
-    setCheckingAll(false);
   }
 
   async function handleCheckAllUpdates() {
@@ -104,54 +122,92 @@ export default function DownloadList() {
       showPreviewNotice();
       return;
     }
+    if (!updateGuard.begin('versions')) return;
+    const flow = createDiagnosticFlow('versions');
+    flow.log('action', 'start');
 
     cancelCheckRef.current = false;
     setCheckingAll(true);
     addToast(t('downloads.checkUpdatesStarted'), 'info');
     let count = 0;
+    const queuedUpdates = new Set<string>();
     const completedTasks = tasks.filter((t) => t.status === 'completed');
 
     setCheckProgress({ current: 0, total: completedTasks.length, appName: '' });
 
-    for (let i = 0; i < completedTasks.length; i++) {
-      if (cancelCheckRef.current) break;
-
-      const task = completedTasks[i];
-      const accountEmail = hashToEmail[task.accountHash];
-      const account = accounts.find((a) => a.email === accountEmail);
-
-      setCheckProgress((prev) => ({ ...prev, appName: task.software.name }));
-
-      if (!account) {
-        setCheckProgress((prev) => ({ ...prev, current: i + 1 }));
-        continue;
-      }
-
-      try {
-        await delay(1500);
+    try {
+      for (let i = 0; i < completedTasks.length; i++) {
         if (cancelCheckRef.current) break;
 
-        const country = storeIdToCountry(account.store) ?? 'US';
-        const latestApp = await lookupApp(task.software.bundleID, country);
+        const task = completedTasks[i];
+        const accountEmail = hashToEmail[task.accountHash];
+        const account = accounts.find((a) => a.email === accountEmail);
 
-        if (latestApp && isNewerVersion(latestApp.version, task.software.version)) {
-          await startDownload(account, latestApp);
-          await deleteDownload(task.id);
-          count++;
+        setCheckProgress((prev) => ({ ...prev, appName: task.software.name }));
+
+        if (!account) {
+          setCheckProgress((prev) => ({ ...prev, current: i + 1 }));
+          continue;
         }
-      } catch {
-        // Continue with next item
+
+        try {
+          await delay(1500);
+          if (cancelCheckRef.current) break;
+
+          const country = storeIdToCountry(account.store) ?? 'US';
+          flow.log('version_lookup', 'start', { attempt: i + 1, endpoint: 'public_version' });
+          const latestApp = await lookupApp(task.software.bundleID, country);
+          flow.log('version_lookup', 'success', { attempt: i + 1 });
+          if (cancelCheckRef.current) break;
+
+          if (latestApp && isNewerVersion(latestApp.version, task.software.version)) {
+            const updateKey = task.accountHash + ':' + task.software.bundleID;
+            const replacement = tasks.some(
+              (other) =>
+                other.id !== task.id &&
+                other.accountHash === task.accountHash &&
+                other.software.bundleID === task.software.bundleID &&
+                other.status !== 'failed' &&
+                !isNewerVersion(latestApp.version, other.software.version),
+            );
+            if (!replacement && !queuedUpdates.has(updateKey) && (await startDownload(account, latestApp)) !== false) {
+              queuedUpdates.add(updateKey);
+              count++;
+            }
+            // Keep the completed IPA until the replacement has actually downloaded.
+          }
+        } catch (error) {
+          flow.log('version_lookup', 'failure', errorDiagnosticDetails(error));
+          addToast(
+            getErrorMessage(
+              getDiagnosticId(error) ? error : attachDiagnosticId(error, flow.id),
+              t('downloads.package.checkUpdateFailed'),
+            ),
+            'error',
+          );
+        }
+
+        setCheckProgress((prev) => ({ ...prev, current: i + 1 }));
       }
 
-      setCheckProgress((prev) => ({ ...prev, current: i + 1 }));
-    }
-
-    if (!cancelCheckRef.current) {
-      await delay(500);
       if (!cancelCheckRef.current) {
-        setCheckingAll(false);
-        addToast(t('downloads.checkUpdatesCompleted', { count }), 'success');
+        await delay(500);
+        if (!cancelCheckRef.current) {
+          setCheckingAll(false);
+          addToast(t('downloads.checkUpdatesCompleted', { count }), 'success');
+        }
       }
+      flow.log(
+        'action',
+        cancelCheckRef.current ? 'cancelled' : 'success',
+        cancelCheckRef.current ? { reason: 'cancelled' } : {},
+      );
+    } catch (error) {
+      flow.log('action', 'failure', errorDiagnosticDetails(error));
+      addToast(getErrorMessage(attachDiagnosticId(error, flow.id), t('downloads.package.checkUpdateFailed')), 'error');
+    } finally {
+      setCheckingAll(false);
+      updateGuard.end();
     }
   }
 

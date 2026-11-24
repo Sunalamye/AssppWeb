@@ -5,21 +5,23 @@ import AppIcon from '../common/AppIcon';
 import CountrySelect from '../common/CountrySelect';
 import { useAccounts } from '../../hooks/useAccounts';
 import { useDownloadAction } from '../../hooks/useDownloadAction';
+import { useActionGuard } from '../../hooks/useActionGuard';
 import { useSettingsStore } from '../../store/settings';
 import { useToastStore } from '../../store/toast';
 import { lookupApp } from '../../api/search';
-import { listVersions } from '../../apple/versionFinder';
 import { firstAccountCountry } from '../../utils/account';
 import { getErrorMessage } from '../../utils/error';
+import { attachDiagnosticId, createDiagnosticFlow, errorDiagnosticDetails } from '../../utils/diagnostics';
 import { countryCodeMap, storeIdToCountry } from '../../apple/config';
 import type { Software } from '../../types';
 
 export default function AddDownload() {
-  const { accounts, updateAccount } = useAccounts();
+  const { accounts } = useAccounts();
   const { defaultCountry } = useSettingsStore();
   const { t } = useTranslation();
   const addToast = useToastStore((s) => s.addToast);
-  const { startDownload, acquireLicense, toastDownloadError, toastLicenseError } = useDownloadAction();
+  const { startDownload, acquireLicense, loadVersions, toastDownloadError, toastLicenseError } = useDownloadAction();
+  const actionGuard = useActionGuard();
 
   const [bundleId, setBundleId] = useState('');
   const [country, setCountry] = useState(defaultCountry);
@@ -69,57 +71,71 @@ export default function AddDownload() {
   async function handleLookup(e: React.FormEvent) {
     e.preventDefault();
     if (!bundleId.trim()) return;
+    if (!actionGuard.begin('download')) return;
+    const flow = createDiagnosticFlow('download');
+    flow.log('version_lookup', 'start', { endpoint: 'public_version' });
     setLoadingAction('lookup');
     try {
       const result = await lookupApp(bundleId.trim(), country);
       if (!result) {
+        flow.log('version_lookup', 'failure', { reason: 'not_found' });
         addToast(t('downloads.add.notFound'), 'error');
         return;
       }
       setApp(result);
+      setVersions([]);
+      setSelectedVersion('');
       setStep('ready');
+      flow.log('version_lookup', 'success');
     } catch (e) {
-      addToast(getErrorMessage(e, t('downloads.add.lookupFailed')), 'error');
+      flow.log('version_lookup', 'failure', errorDiagnosticDetails(e));
+      addToast(getErrorMessage(attachDiagnosticId(e, flow.id), t('downloads.add.lookupFailed')), 'error');
     } finally {
+      actionGuard.end();
       setLoadingAction(null);
     }
   }
 
   async function handleGetLicense() {
     if (!account || !app) return;
+    if (!actionGuard.begin('license')) return;
     setLoadingAction('license');
     try {
       await acquireLicense(account, app);
     } catch (e) {
       toastLicenseError(account, app, e);
     } finally {
+      actionGuard.end();
       setLoadingAction(null);
     }
   }
 
   async function handleLoadVersions() {
     if (!account || !app) return;
+    if (!actionGuard.begin('versions')) return;
     setLoadingAction('versions');
     try {
-      const result = await listVersions(account, app);
+      const result = await loadVersions(account, app);
       setVersions(result.versions);
-      await updateAccount({ ...account, cookies: result.updatedCookies });
       setStep('versions');
     } catch (e) {
       addToast(getErrorMessage(e, t('downloads.add.versionsFailed')), 'error');
     } finally {
+      actionGuard.end();
       setLoadingAction(null);
     }
   }
 
   async function handleDownload() {
     if (!account || !app) return;
+    if (!actionGuard.begin('download')) return;
     setLoadingAction('download');
     try {
       await startDownload(account, app, selectedVersion || undefined);
     } catch (e) {
       toastDownloadError(account, app, e);
     } finally {
+      actionGuard.end();
       setLoadingAction(null);
     }
   }
