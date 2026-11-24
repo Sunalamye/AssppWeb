@@ -149,6 +149,73 @@ describe('Store proof browser state', () => {
     expect(calls.map((call) => call.state)).toEqual([undefined, 'last-valid-state', 'last-valid-state']);
   });
 
+  it('times out a stalled helper body, releases the device queue, and discards the late state', async () => {
+    const calls: Record<string, any>[] = [];
+    let releaseBody!: (value: unknown) => void;
+    let bodyStarted = false;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, options?: RequestInit) => {
+        if (url.endsWith('/health')) return Response.json({ status: 'ready' });
+        calls.push(JSON.parse(String(options?.body)));
+        const response = Response.json({ mode: 'store', state: 'last-valid-state', headers });
+        if (calls.length === 2) {
+          vi.spyOn(response, 'json').mockImplementation(() => {
+            bodyStarted = true;
+            return new Promise((resolve) => (releaseBody = resolve));
+          });
+        }
+        return response;
+      }),
+    );
+    const client = new StoreProofClient(device());
+    await client.bootstrap(endpoint);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    let result: unknown;
+    const pending = client.proof(endpoint).then(
+      (value) => (result = { value }),
+      (error) => (result = { error }),
+    );
+    try {
+      await vi.waitFor(() => expect(bodyStarted).toBe(true));
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(result).toMatchObject({ error: { code: 'HELPER_UNAVAILABLE', diagnostics: { reason: 'timeout' } } });
+      expect(calls).toHaveLength(2);
+    } finally {
+      releaseBody({ state: 'late-state-must-not-be-saved', headers });
+      await pending;
+    }
+    await expect(client.proof(endpoint)).resolves.toEqual(headers);
+    expect(calls.map((call) => call.state)).toEqual([undefined, 'last-valid-state', 'last-valid-state']);
+  });
+
+  it('keeps the readiness deadline active while a health response body is stalled', async () => {
+    let releaseBody!: (value: unknown) => void;
+    let healthCalls = 0;
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (!url.endsWith('/health')) return Response.json({ mode: 'store', state: 'state', headers });
+        healthCalls++;
+        const response = Response.json({ status: 'ready' });
+        if (healthCalls === 1) {
+          vi.spyOn(response, 'json').mockImplementation(() => new Promise((resolve) => (releaseBody = resolve)));
+        }
+        return response;
+      }),
+    );
+    const pending = new StoreProofClient(device()).bootstrap(endpoint);
+    try {
+      await vi.waitFor(() => expect(releaseBody).toBeTypeOf('function'));
+      await vi.advanceTimersByTimeAsync(13_000);
+      expect(healthCalls).toBe(2);
+    } finally {
+      releaseBody({ status: 'ready' });
+      await pending;
+    }
+  });
+
   it('retains the previous state and releases the queue if the updated state cannot be persisted', async () => {
     clearDiagnosticEvents();
     const flow = createDiagnosticFlow('login');

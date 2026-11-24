@@ -23,6 +23,7 @@ vi.mock('../src/config.js', () => ({
     },
   },
   DOWNLOAD_TIMEOUT_MS: 60_000,
+  MIN_ACCOUNT_HASH_LENGTH: 8,
 }));
 vi.mock('../src/services/sinfInjector.js', () => ({ inject: mocks.inject }));
 vi.mock('../src/services/chunkedDownloader.js', () => ({
@@ -80,6 +81,100 @@ afterEach(async () => {
 });
 
 describe('download task generations', () => {
+  it('compiles metadata-only downloads before reporting completion', async () => {
+    const metadata = Buffer.from('<plist><dict/></plist>').toString('base64');
+    const task = manager.createTask(software, 'fixture-account', 'https://fixture.apple.com/file', [], metadata);
+    fs.writeFileSync(mocks.downloads[0].file, 'download fixture');
+    mocks.downloads[0].resolve();
+    await settle();
+    expect(mocks.inject).toHaveBeenCalledWith([], task.filePath, metadata);
+    expect(task.status).toBe('completed');
+    expect(task.iTunesMetadata).toBeUndefined();
+  });
+
+  it('routes package deletion through task cancellation so an old compiler cannot recreate the package', async () => {
+    let finishCompile!: () => void;
+    mocks.inject.mockImplementation(
+      (_sinfs, file: string) =>
+        new Promise<void>((resolve) => {
+          finishCompile = () => {
+            fs.mkdirSync(path.dirname(file), { recursive: true });
+            fs.writeFileSync(file, 'late compiled fixture');
+            resolve();
+          };
+        }),
+    );
+    const task = manager.createTask(software, 'fixture-account', 'https://fixture.apple.com/file', [
+      { id: 1, sinf: 'fixture' },
+    ] as any);
+    const download = mocks.downloads[0];
+    fs.writeFileSync(download.file, 'download fixture');
+    download.resolve();
+    await settle();
+    const router = (await import('../src/routes/packages.js')).default;
+    const handler = router.stack.find((layer) => layer.route?.path === '/packages/:id' && layer.route.methods.delete)!
+      .route.stack[0].handle;
+    const response = { status: vi.fn().mockReturnThis(), json: vi.fn() };
+    handler({ params: { id: task.id }, query: { accountHash: 'fixture-account' } }, response, vi.fn());
+    expect(response.json).toHaveBeenCalledWith({ success: true });
+    finishCompile();
+    await settle();
+    expect(manager.getTask(task.id)).toBeUndefined();
+    expect(fs.existsSync(download.file)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(path.join(mocks.dataDir, 'tasks.json'), 'utf8'))).toEqual([]);
+  });
+
+  it('keeps the last complete task index when publishing a new index fails', async () => {
+    const first = manager.createTask(software, 'fixture-account', 'https://fixture.apple.com/file', []);
+    fs.writeFileSync(mocks.downloads[0].file, 'first completed fixture');
+    mocks.downloads[0].resolve();
+    await settle();
+    const index = path.join(mocks.dataDir, 'tasks.json');
+    const previous = fs.readFileSync(index, 'utf8');
+    const second = manager.createTask(software, 'fixture-account', 'https://fixture.apple.com/file', []);
+    fs.writeFileSync(mocks.downloads[1].file, 'second completed fixture');
+    const publish = vi.spyOn(fs, 'renameSync').mockImplementationOnce(() => {
+      throw Object.assign(new Error('private-persistence-detail'), { code: 'ENOSPC' });
+    });
+    try {
+      mocks.downloads[1].resolve();
+      await settle();
+    } finally {
+      publish.mockRestore();
+    }
+    expect(first.status).toBe('completed');
+    expect(second.status).toBe('failed');
+    expect(fs.readFileSync(index, 'utf8')).toBe(previous);
+    expect(fs.readdirSync(mocks.dataDir)).toEqual(expect.arrayContaining(['packages', 'tasks.json']));
+    expect(fs.readdirSync(mocks.dataDir).filter((file) => file.includes('.tmp'))).toEqual([]);
+    expect(vi.mocked(console.log).mock.calls.flat().join(' ')).not.toContain('private-persistence-detail');
+  });
+
+  it.each(['{broken', '{}', '[{"id":"broken","status":"completed"}]'])(
+    'preserves existing packages if the saved task index is corrupt (%s)',
+    async (index) => {
+      const existing = path.join(mocks.dataDir, 'packages', 'retained.ipa');
+      fs.writeFileSync(existing, 'previously completed package');
+      fs.writeFileSync(path.join(mocks.dataDir, 'tasks.json'), index);
+      vi.resetModules();
+      manager = await import('../src/services/downloadManager.js');
+      expect(fs.readFileSync(existing, 'utf8')).toBe('previously completed package');
+      expect(manager.getAllTasks()).toEqual([]);
+    },
+  );
+
+  it('keeps unindexed final IPAs after a later valid index write and restart while removing transient parts', async () => {
+    const existing = path.join(mocks.dataDir, 'packages', 'retained.ipa');
+    const transient = `${existing}.part0`;
+    fs.writeFileSync(existing, 'recoverable completed package');
+    fs.writeFileSync(transient, 'discardable interrupted transfer');
+    fs.writeFileSync(path.join(mocks.dataDir, 'tasks.json'), '[]');
+    vi.resetModules();
+    manager = await import('../src/services/downloadManager.js');
+    expect(fs.readFileSync(existing, 'utf8')).toBe('recoverable completed package');
+    expect(fs.existsSync(transient)).toBe(false);
+  });
+
   it('waits for a paused writer to settle and prevents its late failure/progress from changing the resumed run', async () => {
     const task = manager.createTask(software, 'fixture-account', 'https://fixture.apple.com/file', []);
     const old = mocks.downloads[0];
@@ -327,6 +422,31 @@ describe('download task generations', () => {
     expect(next.status).toBe('downloading');
     expect(mocks.downloads).toHaveLength(3);
     expect(vi.mocked(console.log).mock.calls.flat().join(' ')).not.toContain('private-cleanup-filesystem-detail');
+  });
+
+  it('does not evict extra packages when a deletion frees space but its metadata update fails', async () => {
+    const first = manager.createTask(software, 'fixture-account', 'https://fixture.apple.com/file', []);
+    const second = manager.createTask(software, 'fixture-account', 'https://fixture.apple.com/file', []);
+    for (const [index, download] of mocks.downloads.entries()) {
+      fs.writeFileSync(download.file, Buffer.alloc(600));
+      const modified = new Date(Date.now() - (2 - index) * 60_000);
+      fs.utimesSync(download.file, modified, modified);
+      download.resolve();
+    }
+    await settle();
+    mocks.autoCleanupMaxMB = 1000 / (1024 * 1024);
+    const publish = vi.spyOn(fs, 'renameSync').mockImplementationOnce(() => {
+      throw Object.assign(new Error('private-cleanup-persist-detail'), { code: 'ENOSPC' });
+    });
+    try {
+      manager.runSpaceCleanup();
+    } finally {
+      publish.mockRestore();
+    }
+    expect(manager.getTask(first.id)).toBeUndefined();
+    expect(fs.existsSync(first.filePath!)).toBe(false);
+    expect(manager.getTask(second.id)).toBe(second);
+    expect(fs.existsSync(second.filePath!)).toBe(true);
   });
 
   it('contains filesystem setup failures instead of leaving a downloading task or an unhandled rejection', async () => {

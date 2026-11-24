@@ -129,6 +129,21 @@ also performs this preparation before reporting `ready`.
 
 ## Verification
 
+The production HTTP service, request validation, diagnostic boundary and
+provisioning policy can also be tested without fetching native dependencies:
+
+```sh
+npm run test:helper
+```
+
+This uses Go's race detector with a mock only at the `proofRuntime` interface.
+The native implementation remains in `runtime.go`; the dependency-free
+interfaces are in `contracts.go`. `npm run verify:formal` additionally compares
+all 16 provisioning-policy inputs against the freshly checked Lean model and
+requires an actual passing Go comparison test, not a skipped or missing test.
+Native finish must pass the handle/device/expiry/context gate, consume the
+handle once, and recheck cancellation/expiry before publishing state.
+
 Run these inside the pinned upstream checkout after copying this directory:
 
 ```sh

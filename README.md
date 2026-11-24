@@ -119,6 +119,38 @@ AssppWeb relies on the Wisp protocol over WebSocket (`/wisp/`) for its zero-trus
 
 </details>
 
+## Verification-guided development
+
+Critical authentication, download-response, download-lifecycle, HTTP Range and
+provisioning decisions have executable specifications in `formal/Asspp.lean`.
+Lean 4.36.0 checks 35 properties, and a freshly executed Lean oracle is compared
+against the production TypeScript and Go policies over 52,421 inputs. Targeted
+mutation checks require 11 production-policy mutations to disagree with the
+oracle and two model mutations to fail their Lean proofs. Positive properties
+also establish successful authentication, download and provisioning paths.
+
+```bash
+npm ci
+npm --prefix frontend ci
+npm --prefix backend ci
+npm run verify
+```
+
+Install the pinned Lean toolchain and Go first, or set `ASSPP_LEAN` and `ASSPP_GO`
+to their executable paths. The full command also runs formatting, unit/race
+tests, TypeScript checks and frontend/backend builds. `npm run verify:formal`
+runs the proof, differential and mutation gate alone.
+
+The Docker runtime depends on a successful verification stage, so the existing
+Cloudflare source build runs the gate before it can produce an image. No new
+GitHub Actions workflow is required. The first uncached build downloads a
+checksum-pinned Lean toolchain; the compiler is not included in the runtime.
+
+See [the verification and repair report](docs/formal-verification.md) for the
+state model, confirmed bugs, proof scope, assumptions and future-change workflow.
+External Apple acceptance, browser/OS behavior, cryptographic implementations
+and live deployment readiness remain separate integration boundaries.
+
 ## Security Recommendations
 
 **DDoS Protection**

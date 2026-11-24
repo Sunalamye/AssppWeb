@@ -372,7 +372,12 @@ func (s *proofService) provisionStart(w http.ResponseWriter, ctx context.Context
 
 func (s *proofService) provisionFinish(w http.ResponseWriter, ctx context.Context, r *proofRequest) {
 	pending, ok := s.pending[r.pending]
-	if !ok || pending.deviceID != r.deviceID {
+	decision := provisionReject
+	if ok {
+		decision = decideProvisionFinish(true, pending.deviceID == r.deviceID,
+			!s.now().Before(pending.expires), pending.ctx != nil && pending.ctx.Err() != nil)
+	}
+	if decision == provisionReject {
 		writeAPIError(w, http.StatusGone, "PROVISIONING_EXPIRED", "Device provisioning has expired. Sign in again.")
 		return
 	}
@@ -381,8 +386,18 @@ func (s *proofService) provisionFinish(w http.ResponseWriter, ctx context.Contex
 	defer pending.runtime.Close()
 	stop := context.AfterFunc(ctx, pending.cancel)
 	defer stop()
+	// AfterFunc schedules cancellation asynchronously. A caller cancelled after
+	// gate acquisition must be rejected here before native Finish can mutate state.
+	if err := ctx.Err(); err != nil {
+		writeRuntimeError(w, ctx, err)
+		return
+	}
+	if decision == provisionExpire {
+		writeAPIError(w, http.StatusGone, "PROVISIONING_EXPIRED", "Device provisioning has expired. Sign in again.")
+		return
+	}
 	encoded, err := pending.runtime.Finish(r.settingInfo, r.transportKey, r.keybag)
-	if pending.ctx != nil && pending.ctx.Err() != nil && ctx.Err() == nil {
+	if (!s.now().Before(pending.expires) || (pending.ctx != nil && pending.ctx.Err() != nil)) && ctx.Err() == nil {
 		writeAPIError(w, http.StatusGone, "PROVISIONING_EXPIRED", "Device provisioning has expired. Sign in again.")
 		return
 	}

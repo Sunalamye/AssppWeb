@@ -3,7 +3,10 @@
   "private": true,
   "scripts": {
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "test:helper": "node scripts/test-helper.mjs",
+    "verify:formal": "node scripts/verify-formal.mjs",
+    "verify": "npm run format:check && npm --prefix frontend test && npm --prefix backend test && npm run test:helper && node frontend/node_modules/typescript/bin/tsc --noEmit --project frontend/tsconfig.json && npm --prefix frontend run build && npm --prefix backend run build && npm run verify:formal"
   },
   "devDependencies": {
     "prettier": "3.6.2"

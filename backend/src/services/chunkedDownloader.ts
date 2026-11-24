@@ -1,8 +1,10 @@
 import fs from 'fs';
 import path from 'path';
-import { pipeline } from 'stream/promises';
-import { Readable } from 'stream';
+import { finished, pipeline } from 'stream/promises';
+import { Readable, Transform } from 'stream';
+import { setTimeout as delay } from 'timers/promises';
 import { DOWNLOAD_THREADS, CHUNK_RETRY_COUNT, CHUNK_RETRY_DELAY_MS, MAX_DOWNLOAD_SIZE } from '../config.js';
+import { acceptChunk, parseContentLength, parseContentRange } from '../domain/downloadPolicy.js';
 import type { DiagnosticDetails, DiagnosticEvent } from '../utils/diagnostics.js';
 
 interface ChunkRange {
@@ -48,7 +50,8 @@ export class ChunkedDownloader {
   ) {
     this.url = url;
     this.destPath = destPath;
-    this.threads = options?.threads ?? DOWNLOAD_THREADS;
+    const threads = options?.threads ?? DOWNLOAD_THREADS;
+    this.threads = Number.isSafeInteger(threads) ? Math.max(1, Math.min(32, threads)) : DOWNLOAD_THREADS;
     this.onProgress = options?.onProgress;
     this.onDiagnostic = options?.onDiagnostic;
   }
@@ -70,6 +73,7 @@ export class ChunkedDownloader {
       method: 'HEAD',
       signal,
       redirect: 'follow',
+      headers: { 'Accept-Encoding': 'identity' },
     });
     if (!res.ok) {
       this.diagnostic('failure', { httpStatus: res.status, reason: 'http_error' });
@@ -77,7 +81,7 @@ export class ChunkedDownloader {
     }
 
     const acceptRanges = res.headers.get('accept-ranges');
-    const contentLength = parseInt(res.headers.get('content-length') || '0', 10);
+    const contentLength = parseContentLength(res.headers.get('content-length')) ?? 0;
     const supportsRange = acceptRanges === 'bytes' && contentLength > 0;
 
     return { supportsRange, contentLength };
@@ -111,56 +115,48 @@ export class ChunkedDownloader {
       signal.addEventListener('abort', onAbort, { once: true });
 
       try {
+        this.chunkBytes[chunk.index] = 0;
         const res = await fetch(this.url, {
           signal: ac.signal,
           redirect: 'follow',
-          headers: { Range: `bytes=${chunk.start}-${chunk.end}` },
+          headers: { Range: `bytes=${chunk.start}-${chunk.end}`, 'Accept-Encoding': 'identity' },
         });
 
-        if (res.status !== 206 && res.status !== 200) {
-          throw new Error(`Chunk ${chunk.index}: HTTP ${res.status}`);
-        }
-        if (!res.body) {
-          throw new Error(`Chunk ${chunk.index}: no body`);
+        const range = parseContentRange(res.headers.get('content-range'));
+        const acceptance = {
+          status: res.status,
+          validRange: range !== null,
+          start: range?.start ?? 0,
+          end: range?.end ?? 0,
+          total: range?.total ?? 0,
+          expectedStart: chunk.start,
+          expectedEnd: chunk.end,
+          expectedTotal: this.totalSize,
+          actualBytes: expectedBytes,
+        };
+        if (!acceptChunk(acceptance) || !res.body) {
+          await res.body?.cancel();
+          this.diagnostic('failure', { httpStatus: res.status, reason: 'invalid_response' });
+          throw new Error(`Chunk ${chunk.index}: invalid range response`);
         }
 
-        const ws = fs.createWriteStream(partPath);
-        const reader = res.body.getReader();
-        const chunkBytesRef = this.chunkBytes;
-        const chunkIndex = chunk.index;
-        let chunkDownloaded = 0;
-
-        const readable = new Readable({
-          async read() {
-            try {
-              const { done, value } = await reader.read();
-              if (done) {
-                this.push(null);
-                return;
-              }
-              chunkDownloaded += value.byteLength;
-              if (chunkDownloaded > expectedBytes * 2) {
-                this.destroy(new Error(`Chunk ${chunkIndex}: exceeded expected size`));
-                return;
-              }
-              chunkBytesRef[chunkIndex] = chunkDownloaded;
-              this.push(Buffer.from(value));
-            } catch (err) {
-              this.destroy(err instanceof Error ? err : new Error(String(err)));
-            }
-          },
+        const actualBytes = await this.writeResponse(res, partPath, expectedBytes, ac.signal, (downloaded) => {
+          this.chunkBytes[chunk.index] = downloaded;
         });
-
-        await pipeline(readable, ws);
+        if (!acceptChunk({ ...acceptance, actualBytes })) {
+          this.diagnostic('failure', { reason: 'invalid_response' });
+          throw new Error(`Chunk ${chunk.index}: incomplete range response`);
+        }
         return; // success
       } catch (err) {
         lastErr = err instanceof Error ? err : new Error(String(err));
         if (lastErr.name === 'AbortError' || this.aborted) throw lastErr;
         if (attempt < CHUNK_RETRY_COUNT - 1) {
           this.diagnostic('retry', { attempt: attempt + 2, retryDelayMs: CHUNK_RETRY_DELAY_MS, reason: 'network' });
-          await new Promise((r) => setTimeout(r, CHUNK_RETRY_DELAY_MS));
+          await delay(CHUNK_RETRY_DELAY_MS, undefined, { signal: ac.signal });
         }
       } finally {
+        ac.abort();
         signal.removeEventListener('abort', onAbort);
         this.abortControllers.delete(ac);
       }
@@ -170,20 +166,53 @@ export class ChunkedDownloader {
   }
 
   /** Merge all .part files into the final destination. */
-  private async mergeChunks(chunkCount: number): Promise<void> {
+  private async mergeChunks(chunkCount: number, signal: AbortSignal): Promise<void> {
     const ws = fs.createWriteStream(this.destPath);
-    for (let i = 0; i < chunkCount; i++) {
-      const partPath = `${this.destPath}.part${i}`;
-      const rs = fs.createReadStream(partPath);
-      await pipeline(rs, ws, { end: false });
+    try {
+      for (let i = 0; i < chunkCount; i++) {
+        const partPath = `${this.destPath}.part${i}`;
+        const rs = fs.createReadStream(partPath);
+        await pipeline(rs, ws, { end: false, signal });
+      }
+      const completed = finished(ws);
+      ws.end();
+      await completed;
+    } catch (error) {
+      ws.destroy();
+      throw error;
     }
-    ws.end();
-    await new Promise<void>((resolve, reject) => {
-      ws.on('finish', resolve);
-      ws.on('error', reject);
-    });
 
     this.cleanPartFiles(chunkCount);
+  }
+
+  /** Check the decoded byte count while streaming, and propagate cancellation to the response body. */
+  private async writeResponse(
+    response: Response,
+    destination: string,
+    limit: number,
+    signal: AbortSignal,
+    onBytes: (downloaded: number) => void,
+  ): Promise<number> {
+    if (!response.body) throw new Error('No response body');
+    let downloaded = 0;
+    const verifier = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        downloaded += chunk.length;
+        if (downloaded > limit) {
+          callback(new Error('Download exceeded expected size'));
+          return;
+        }
+        onBytes(downloaded);
+        callback(null, chunk);
+      },
+    });
+    await pipeline(
+      Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]),
+      verifier,
+      fs.createWriteStream(destination),
+      { signal },
+    );
+    return downloaded;
   }
 
   /** Remove .part temporary files. */
@@ -200,42 +229,27 @@ export class ChunkedDownloader {
 
   /** Single-stream fallback download. */
   private async downloadSingleStream(signal: AbortSignal): Promise<void> {
-    const res = await fetch(this.url, { signal, redirect: 'follow' });
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+    const res = await fetch(this.url, { signal, redirect: 'follow', headers: { 'Accept-Encoding': 'identity' } });
+    if (res.status !== 200) {
+      await res.body?.cancel();
+      throw new Error(`Unexpected single-stream HTTP ${res.status}`);
+    }
     if (!res.body) throw new Error('No response body');
 
-    const contentLength = parseInt(res.headers.get('content-length') || '0', 10);
-    if (contentLength > MAX_DOWNLOAD_SIZE) {
+    const lengthHeader = res.headers.get('content-length');
+    const contentLength = parseContentLength(lengthHeader);
+    if (
+      (lengthHeader !== null && contentLength === null) ||
+      (contentLength !== null && contentLength > MAX_DOWNLOAD_SIZE)
+    ) {
+      await res.body.cancel();
       throw new Error(`File too large: ${contentLength} bytes exceeds ${MAX_DOWNLOAD_SIZE} byte limit`);
     }
 
-    this.totalSize = contentLength;
+    this.totalSize = contentLength ?? 0;
     let downloaded = 0;
     let lastTime = Date.now();
     let lastBytes = 0;
-
-    const ws = fs.createWriteStream(this.destPath);
-    const reader = res.body.getReader();
-
-    const readable = new Readable({
-      async read() {
-        try {
-          const { done, value } = await reader.read();
-          if (done) {
-            this.push(null);
-            return;
-          }
-          downloaded += value.byteLength;
-          if (downloaded > MAX_DOWNLOAD_SIZE) {
-            this.destroy(new Error('Download exceeded maximum size'));
-            return;
-          }
-          this.push(Buffer.from(value));
-        } catch (err) {
-          this.destroy(err instanceof Error ? err : new Error(String(err)));
-        }
-      },
-    });
 
     const progressInterval = setInterval(() => {
       const now = Date.now();
@@ -253,7 +267,13 @@ export class ChunkedDownloader {
     }, 500);
 
     try {
-      await pipeline(readable, ws);
+      downloaded = await this.writeResponse(res, this.destPath, contentLength ?? MAX_DOWNLOAD_SIZE, signal, (bytes) => {
+        downloaded = bytes;
+      });
+      if (downloaded === 0 || (contentLength !== null && downloaded !== contentLength)) {
+        this.diagnostic('failure', { reason: 'invalid_response' });
+        throw new Error('Incomplete single-stream response');
+      }
     } finally {
       clearInterval(progressInterval);
     }
@@ -268,6 +288,26 @@ export class ChunkedDownloader {
    */
   async download(signal: AbortSignal): Promise<void> {
     if (this.aborted || signal.aborted) throw new DOMException('Aborted', 'AbortError');
+    const controller = new AbortController();
+    this.abortControllers.add(controller);
+    const onAbort = () => controller.abort();
+    signal.addEventListener('abort', onAbort, { once: true });
+    try {
+      await this.runDownload(controller.signal);
+    } catch (error) {
+      try {
+        fs.unlinkSync(this.destPath);
+      } catch {
+        /* Never created or already removed. */
+      }
+      throw error;
+    } finally {
+      signal.removeEventListener('abort', onAbort);
+      this.abortControllers.delete(controller);
+    }
+  }
+
+  private async runDownload(signal: AbortSignal): Promise<void> {
     let supportsRange = false;
     let contentLength = 0;
     try {
@@ -320,7 +360,7 @@ export class ChunkedDownloader {
       await Promise.all(pendingChunks);
 
       clearInterval(progressInterval);
-      await this.mergeChunks(chunks.length);
+      await this.mergeChunks(chunks.length, signal);
 
       this.onProgress?.({
         downloaded: this.totalSize,

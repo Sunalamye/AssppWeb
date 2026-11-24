@@ -53,6 +53,7 @@ describe('apple/authenticate transient responses', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(appleRequest).mockReset();
     vi.useFakeTimers();
     vi.mocked(fetchBag).mockResolvedValue({
       authURL: 'https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate/',
@@ -110,4 +111,20 @@ describe('apple/authenticate transient responses', () => {
     await expect(login()).rejects.toThrow(i18n.t('errors.auth.retryLater', { seconds: 120 }));
     expect(appleRequest).toHaveBeenCalledTimes(1);
   });
+
+  it.each([{ action: { kind: 'Goto' } }, { dialog: false }, { status: 1 }, { status: '0' }, { failureType: [] }])(
+    'does not retry a populated denial or malformed marker under a transient status: %j',
+    async (dict) => {
+      vi.mocked(appleRequest)
+        .mockResolvedValueOnce({ ...transientReply(503), body: buildPlist(dict) })
+        .mockResolvedValueOnce(accountReply());
+      const result = login().then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      );
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(await result).toMatchObject({ error: { codeRequired: false } });
+      expect(appleRequest).toHaveBeenCalledOnce();
+    },
+  );
 });

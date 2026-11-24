@@ -6,11 +6,14 @@ import { fetchBag, normalizeAuthURL } from './bag';
 import { connectSAP } from './sap';
 import { toBase64 } from './sap/bytes';
 import { StoreProofClient } from './storeProof';
+import { hasResponseField, isResponseDictionary, responseFailureCode, validFailureType } from './responseShape';
+import { decideAuthResponse } from '../domain/authPolicy';
 import { createDiagnosticFlow, errorDiagnosticDetails, attachDiagnosticId } from '../utils/diagnostics';
 import { publicStorefrontId } from '../utils/storefront';
 import type { DiagnosticFlow, DiagnosticDetails } from '../utils/diagnostics';
 import type { StoreProofMode } from './storeProof';
 import type { SAPSigner } from './sap/signer';
+import type { AuthResponseFacts } from '../domain/authPolicy';
 import type { Account, Cookie } from '../types';
 
 export class AuthenticationError extends Error {
@@ -55,11 +58,46 @@ function responseDictionary(response: AuthResponse): Record<string, any> | undef
   if (!response.body.trim()) return undefined;
   try {
     const value = parsePlist(response.body);
-    if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+    if (isResponseDictionary(value)) return value;
   } catch {
     /* A safe stage/status diagnostic is produced by the caller. */
   }
   return undefined;
+}
+
+function authResponseFacts(
+  dict: Record<string, any>,
+  httpOk: boolean,
+  firstAttempt: boolean,
+  hasToken = false,
+  hasDsid = false,
+): AuthResponseFacts {
+  const failure = responseFailureCode(dict.failureType);
+  return {
+    validShape:
+      validFailureType(dict.failureType) &&
+      (dict.customerMessage === undefined || typeof dict.customerMessage === 'string') &&
+      (dict.passwordToken === undefined || typeof dict.passwordToken === 'string') &&
+      (dict.dsPersonId === undefined ||
+        typeof dict.dsPersonId === 'string' ||
+        (typeof dict.dsPersonId === 'number' && Number.isSafeInteger(dict.dsPersonId))),
+    dialogPresent: hasResponseField(dict, 'dialog'),
+    actionPresent: hasResponseField(dict, 'action'),
+    rejectedStatus: dict.status !== undefined && dict.status !== 0,
+    failure: !failure ? 'none' : failure === '-5000' ? 'retryCredentials' : 'other',
+    message:
+      dict.customerMessage === 'MZFinance.BadLogin.Configurator_message'
+        ? 'verification'
+        : dict.customerMessage === 'Your account is disabled.'
+          ? 'disabled'
+          : dict.customerMessage
+            ? 'other'
+            : 'none',
+    firstAttempt,
+    httpOk,
+    hasToken,
+    hasDsid,
+  };
 }
 
 async function sendWithTransientRetry(
@@ -76,7 +114,21 @@ async function sendWithTransientRetry(
     if (!isTransientAuthStatus(response.status)) return response;
     const dict = responseDictionary(response);
     // Never turn a populated account/credential error into automatic retries.
-    if (dict && (dict.failureType || dict.customerMessage || dict.dialog)) return response;
+    if (dict) {
+      const facts = authResponseFacts(dict, response.status === 200, false);
+      if (
+        !facts.validShape ||
+        facts.dialogPresent ||
+        facts.actionPresent ||
+        facts.rejectedStatus ||
+        facts.failure !== 'none' ||
+        facts.message !== 'none' ||
+        hasResponseField(dict, 'passwordToken') ||
+        hasResponseField(dict, 'dsPersonId')
+      ) {
+        return response;
+      }
+    }
     statuses.push(response.status);
     if (statuses.length === AUTH_REQUEST_ATTEMPTS) {
       flow?.log(stage, 'blocked', { httpStatus: response.status, attempt: statuses.length, reason: 'retry_exhausted' });
@@ -487,18 +539,30 @@ export class Authenticator {
             reason: response.body.trim() ? 'invalid_plist' : 'empty_response',
             httpStatus: response.status,
           });
-        const failure = String(dict.failureType ?? '');
-        if (failure === '-5000' && attempt === 1) {
+        const failure = responseFailureCode(dict.failureType);
+        const token = typeof dict.passwordToken === 'string' ? dict.passwordToken : '';
+        const dsid = responseDSID(dict, response);
+        const facts = authResponseFacts(dict, response.status === 200, attempt === 1, !!token, !!dsid);
+        const decision = decideAuthResponse(facts);
+        if (decision === 'retry_credentials') {
           attempt = 2;
           currentFlow.log(stage, 'retry', { errorCode: '-5000', attempt, reason: 'protocol_action' });
           continue;
         }
-        if (!failure && dict.customerMessage === 'MZFinance.BadLogin.Configurator_message') {
+        if (decision === 'verification') {
           if (!verificationCode) throw new AuthenticationError(i18n.t('errors.auth.requiresVerification'), true);
           throw new AuthenticationError('Apple did not complete verification. Enter a fresh verification code.', true);
         }
         const failureMessage = dict.dialog?.explanation ?? dict.dialog?.message ?? dict.customerMessage;
-        if (failure || dict.dialog || dict.customerMessage === 'Your account is disabled.') {
+        if (
+          decision === 'reject' &&
+          facts.validShape &&
+          (failure ||
+            facts.dialogPresent ||
+            facts.actionPresent ||
+            facts.rejectedStatus ||
+            facts.message === 'disabled')
+        ) {
           currentFlow.log(stage, 'blocked', {
             errorCode: failure,
             reason: 'access_denied',
@@ -516,9 +580,7 @@ export class Authenticator {
             },
           );
         }
-        const token = typeof dict.passwordToken === 'string' ? dict.passwordToken : '';
-        const dsid = responseDSID(dict, response);
-        if (response.status !== 200 || !token || !dsid) {
+        if (decision !== 'authenticated') {
           throw new AuthenticationError(
             `Apple returned no usable authentication response (HTTP ${response.status}); missing account credentials`,
             false,

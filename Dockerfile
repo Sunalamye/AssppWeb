@@ -31,6 +31,28 @@ RUN npm ci
 COPY backend/ ./
 RUN npm run build
 
+# Cache the official proof toolchain separately from application source changes.
+FROM node:22-bookworm-slim AS lean-build
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates zstd \
+    && rm -rf /var/lib/apt/lists/*
+COPY scripts/install-lean.sh /tmp/install-lean.sh
+RUN sh /tmp/install-lean.sh /opt/lean
+
+# A required gate for both Cloudflare's Docker build and ordinary Docker builds.
+# The final COPY from this stage makes BuildKit execute it; an unreferenced
+# optional stage would be skipped and could not prevent publishing bad source.
+FROM backend-build AS verification
+WORKDIR /verification
+COPY --from=proof-build /usr/local/go /usr/local/go
+COPY --from=lean-build /opt/lean /opt/lean
+ENV PATH="/opt/lean/bin:/usr/local/go/bin:${PATH}"
+COPY package*.json ./
+RUN npm ci
+COPY --from=frontend-build /app/frontend/node_modules ./frontend/node_modules
+COPY --from=backend-build /app/backend/node_modules ./backend/node_modules
+COPY . ./
+RUN npm run verify
+
 # Runtime
 FROM node:22-bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends zip ca-certificates \
@@ -44,6 +66,7 @@ COPY --from=proof-build /out/asspp-proof /usr/local/bin/asspp-proof
 COPY --from=proof-build /opt/asspp-cache /opt/asspp-cache
 COPY --from=proof-build /src/ipatool/LICENSE ./licenses/ipatool-LICENSE
 COPY container/start.mjs ./container/start.mjs
+COPY --from=verification /verification/formal/.lake/verification/verified.json ./formal-verification.json
 RUN mkdir -p /data/packages
 EXPOSE 8080
 ARG BUILD_COMMIT=unknown

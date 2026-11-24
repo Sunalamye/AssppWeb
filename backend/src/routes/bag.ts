@@ -1,7 +1,8 @@
-import { Router, Request, Response } from 'express';
+import { Router } from 'express';
 import https from 'https';
 import { BAG_TIMEOUT_MS, BAG_MAX_BYTES } from '../config.js';
 import { observeRequest } from '../utils/diagnostics.js';
+import type { Request, Response } from 'express';
 
 const router = Router();
 const userAgent = 'Configurator/2.21 (Macintosh; OS X 27.0.1; 26A434) AppleWebKit/0625.2.5.11.6';
@@ -26,6 +27,19 @@ router.get('/bag', async (req: Request, res: Response) => {
   }
 
   const url = `https://init.itunes.apple.com/bag.xml?ix=6&guid=${encodeURIComponent(guid)}`;
+  const controller = new AbortController();
+  let timedOut = false;
+  // A socket inactivity timeout can be reset forever by a trickling response.
+  // Bound the entire request, including DNS, TLS and body consumption.
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    trace.result({ reason: 'timeout' });
+    controller.abort();
+  }, BAG_TIMEOUT_MS);
+  const onClose = () => {
+    if (!res.writableEnded) controller.abort();
+  };
+  res.on('close', onClose);
 
   try {
     const body = await new Promise<string>((resolve, reject) => {
@@ -36,7 +50,7 @@ router.get('/bag', async (req: Request, res: Response) => {
             'User-Agent': userAgent,
             Accept: 'application/xml',
           },
-          timeout: BAG_TIMEOUT_MS,
+          signal: controller.signal,
         },
         (resp) => {
           let data = '';
@@ -65,12 +79,9 @@ router.get('/bag', async (req: Request, res: Response) => {
         },
       );
       request.on('error', reject);
-      request.on('timeout', () => {
-        trace.result({ reason: 'timeout' });
-        request.destroy();
-        reject(new Error('Bag request timed out'));
-      });
     });
+    controller.signal.throwIfAborted();
+    if (res.destroyed) return;
 
     // Extract plist from XML wrapper
     const plistMatch = body.match(/<plist[\s\S]*<\/plist>/);
@@ -83,7 +94,11 @@ router.get('/bag', async (req: Request, res: Response) => {
     // Return raw plist XML for the client to parse
     res.type('text/xml').send(plistMatch[0]);
   } catch {
-    res.status(502).json({ error: 'Bag request failed' });
+    if (!res.destroyed) res.status(timedOut ? 504 : 502).json({ error: 'Bag request failed' });
+  } finally {
+    clearTimeout(timeout);
+    res.off('close', onClose);
+    controller.abort();
   }
 });
 

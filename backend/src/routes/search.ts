@@ -1,7 +1,10 @@
-import { Router, Request, Response } from 'express';
+import { Router } from 'express';
 import { observeRequest } from '../utils/diagnostics.js';
+import type { Request, Response } from 'express';
+import type { DiagnosticDetails } from '../utils/diagnostics.js';
 
 const router = Router();
+const catalogTimeoutMs = 15_000;
 
 // Map iTunes API fields to our Software type, matching Swift CodingKeys
 function mapSoftware(item: Record<string, any>) {
@@ -27,35 +30,62 @@ function mapSoftware(item: Record<string, any>) {
   };
 }
 
-router.get('/search', async (req: Request, res: Response) => {
+async function catalogRequest(req: Request, res: Response, endpoint: 'search' | 'lookup') {
   const trace = observeRequest(req, res, 'download', 'action', 'public_version');
+  const controller = new AbortController();
+  let timedOut = false;
+  let reason: DiagnosticDetails['reason'] = 'network';
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, catalogTimeoutMs);
+  const onClose = () => {
+    if (!res.writableEnded) controller.abort();
+  };
+  res.on('close', onClose);
   try {
     const params = new URLSearchParams(req.query as Record<string, string>);
-    const response = await fetch(`https://itunes.apple.com/search?${params.toString()}`);
-    const data = await response.json();
-    const results = (data.results ?? []).map(mapSoftware);
-    res.json(results);
-  } catch {
-    trace.result({ reason: 'network' });
-    res.status(500).json({ error: 'Search request failed' });
-  }
-});
-
-router.get('/lookup', async (req: Request, res: Response) => {
-  const trace = observeRequest(req, res, 'download', 'action', 'public_version');
-  try {
-    const params = new URLSearchParams(req.query as Record<string, string>);
-    const response = await fetch(`https://itunes.apple.com/lookup?${params.toString()}`);
-    const data = await response.json();
-    if (!data.resultCount || !data.results?.length) {
-      res.json(null);
-      return;
+    const response = await fetch(`https://itunes.apple.com/${endpoint}?${params.toString()}`, {
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      reason = 'http_error';
+      trace.event('apple_request', 'failure', { endpoint: 'public_version', reason, httpStatus: response.status });
+      throw new Error('Catalog HTTP request failed');
     }
-    res.json(mapSoftware(data.results[0]));
-  } catch {
-    trace.result({ reason: 'network' });
-    res.status(500).json({ error: 'Lookup request failed' });
+    const data: unknown = await response.json();
+    controller.signal.throwIfAborted();
+    const wrapper = data as { resultCount?: unknown; results?: unknown } | null;
+    if (
+      !wrapper ||
+      typeof wrapper !== 'object' ||
+      Array.isArray(wrapper) ||
+      typeof wrapper.resultCount !== 'number' ||
+      !Number.isSafeInteger(wrapper.resultCount) ||
+      !Array.isArray(wrapper.results) ||
+      wrapper.resultCount !== wrapper.results.length ||
+      wrapper.results.some((item) => !item || typeof item !== 'object' || Array.isArray(item))
+    ) {
+      reason = 'invalid_response';
+      throw new Error('Invalid catalog response');
+    }
+    const results = wrapper.results.map(mapSoftware);
+    if (!res.destroyed) res.json(endpoint === 'search' ? results : (results[0] ?? null));
+  } catch (error) {
+    if (res.destroyed || res.writableEnded) return;
+    trace.result({ reason: timedOut ? 'timeout' : error instanceof SyntaxError ? 'invalid_response' : reason });
+    res
+      .status(timedOut ? 504 : 502)
+      .json({ error: endpoint === 'search' ? 'Search request failed' : 'Lookup request failed' });
+  } finally {
+    clearTimeout(timeout);
+    res.off('close', onClose);
+    // Cancel unconsumed error bodies as well as an interrupted successful body.
+    controller.abort();
   }
-});
+}
+
+router.get('/search', (req: Request, res: Response) => catalogRequest(req, res, 'search'));
+router.get('/lookup', (req: Request, res: Response) => catalogRequest(req, res, 'lookup'));
 
 export default router;

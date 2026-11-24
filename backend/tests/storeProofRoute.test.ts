@@ -118,6 +118,20 @@ describe('device proof HTTP boundary', () => {
     expect(unavailable.text).not.toContain('secret-state');
   });
 
+  it('releases an oversized helper response before reading its body', async () => {
+    let signal: AbortSignal | undefined;
+    const body = new ReadableStream<Uint8Array>();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, options) => {
+      signal = options?.signal as AbortSignal;
+      return new Response(body, { headers: { 'Content-Length': String(4 * 1024 * 1024 + 1) } });
+    });
+    const response = await request(app()).post('/api/store-proof').send(input);
+    expect(response.status).toBe(503);
+    expect(response.body.error.code).toBe('HELPER_UNAVAILABLE');
+    expect(signal?.aborted).toBe(true);
+    await body.cancel();
+  });
+
   it('correlates helper readiness without forwarding credentials or reflecting state', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json({ status: 'ready', state: 'do-not-reflect' }));
     const flowId = '34aa2f6d-56d3-4491-a24f-01fc597823c3';

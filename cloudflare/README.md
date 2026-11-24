@@ -13,6 +13,13 @@ AssppWeb backend needs:
 
 Cloudflare Containers builds the root `Dockerfile`. The Worker remains a router; native code runs in the container, not in the JavaScript Workers isolate. The container supervisor starts the Node.js application and the loopback-only device-proof helper together and stops the container if either process exits.
 
+The Docker runtime depends on the `verification` stage. That stage runs the
+repository's unit/race/type/build checks and its Lean specification,
+differential and mutation gate. A failed gate prevents a runtime image from
+being produced; the first uncached build downloads the checksum-pinned official
+Lean toolchain. No additional GitHub Actions workflow or Cloudflare binding is
+required. See [the verification report](../docs/formal-verification.md).
+
 ## Deploy
 
 If Workers Builds already watches this repository's `main` branch, commit and push to `main` to use that existing deployment pipeline. The native authentication update needs no additional Cloudflare binding, secret, or account resource. An uncached Docker build also downloads and verifies the public native assets; subsequent builds can reuse their cache.

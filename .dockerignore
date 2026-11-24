@@ -12,3 +12,7 @@ icon.jpg
 references
 compose*.yml
 .DS_Store
+formal/.lake
+formal/*.olean
+formal/*.ilean
+formal/*.c

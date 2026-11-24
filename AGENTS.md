@@ -11,7 +11,8 @@
 
 - `backend/` — Node.js/Express server (TypeScript, ESM)
 - `frontend/` — React SPA (TypeScript, Vite, Tailwind CSS)
-- `e2e/` — Playwright E2E tests (pnpm)
+- `formal/` — Lean executable decision models, properties, and oracle
+- `scripts/` — verification, differential/mutation checks, and helper tests
 - `proof-helper/` — loopback-only Go adapter around pinned ipatool native device-proof APIs
 - `references/ApplePackage/` — historical Swift protocol reference, when available
 - Multi-stage Docker build (one container serves the frontend, backend, and proof helper)
@@ -221,28 +222,36 @@ cd backend && npx vitest run    # Node environment
 cd frontend && npx vitest run   # jsdom environment with fake-indexeddb
 ```
 
-### E2E Tests (Playwright)
+### Specification and Verification Gate
 
 ```bash
-cd e2e && pnpm test                            # Local (requires Docker on port 8080)
-docker compose --profile test run --rm playwright  # Docker-based
-bash e2e/docker-test.sh                        # Full: build + test + zero-trust verify
+npm run verify          # Formatting, units/race, types, builds, Lean and correspondence
+npm run verify:formal   # Fresh kernel proofs, oracle, TypeScript/Go and mutation checks
+npm run test:helper     # Actual HTTP service with mocked native runtime, Go -race
 ```
 
-E2E tests import from `./fixtures` instead of `@playwright/test`.
+Use the Lean version in `formal/lean-toolchain`; `ASSPP_LEAN` and `ASSPP_GO` may
+select compiler executable paths. Missing compilers, skipped comparison tests,
+stale oracle output, failed proofs or surviving mutations must fail the gate.
+See `docs/formal-verification.md` for the model/implementation map and proof limits.
 
-WebSocket proxy tests use `location.host` to derive URLs dynamically, so they work both locally (`localhost:8080`) and in Docker (`asspp:8080`).
+For changes to a modeled policy, update its executable Lean definition and
+properties first, then the production policy, extraction/call sites, oracle
+enumeration and counterexample tests. Do not add a success path that bypasses
+the policy or weaken a property merely to make a new implementation pass.
+Keep the mandatory Docker verification dependency and checksum-pinned toolchain.
 
-Historical real-account Docker verification (2026-02-22): authentication succeeded through Wisp, and backend logs contained only connection/stream metadata (no Apple credentials, password tokens, or cookies). That check predates native Store AMD authentication and does not validate the current account flow. Native runtime smoke tests use synthetic identifiers; actual account acceptance must be verified in the user's browser.
+### Browser and Live Acceptance
 
-E2E tests cover:
+This checkout has no `e2e/` directory or Compose Playwright service. Do not report
+the removed historical Playwright commands as current verification. Frontend
+component tests use jsdom; they do not replace a real-browser acceptance run.
 
-- Wisp proxy (accepts /wisp/ WebSocket, rejects non-wisp paths)
-- Add account flow (device ID field, randomize button, auth)
-- Account detail (device ID, pod display)
-- Settings page (no global device ID section)
-- Search/lookup by bundle ID (verifies iTunes field mapping)
-- Downloads API (iTunesMetadata support, backward compatibility)
+Historical real-account Docker verification (2026-02-22) predates native Store
+AMD authentication. Actual account login/2FA, license acquisition, CDN download
+and iOS installation must be verified in the user's browser with correlated
+diagnostics. Never label synthetic accounts, protocol fixtures, or a successful
+build as live Apple acceptance.
 
 ### Test Account
 
@@ -256,17 +265,19 @@ docker compose up --build -d   # Builds and runs on port 8080
 
 A single container serves Express and the Vite-built React SPA and runs the loopback native proof helper. `container/start.mjs` supervises both processes. The Docker build prepares verified public runtime assets; it must not provision a device or use an Apple account at build time. SPA routes are handled by serving `index.html` for all non-API paths. The existing Cloudflare configuration builds `./Dockerfile`, so a configured Workers Builds connection deploys source updates from `main`.
 
-### Docker E2E Testing
+### Docker Verification
 
-The `compose.yml` includes a `playwright` service under the `test` profile:
+The runtime image copies `formal-verification.json` from the required
+`verification` stage. BuildKit therefore must execute `npm run verify`; an
+unreferenced optional stage would not gate publication. The Lean and Go build
+tools stay out of the runtime image. To build the verification stage alone:
 
 ```bash
-docker compose --profile test run --rm playwright
+docker build --target verification .
 ```
 
-This runs Playwright inside the official `mcr.microsoft.com/playwright` image, connecting to the app container via Docker internal DNS (`http://asspp:8080`). The `asspp` service has a healthcheck so the test container waits until the app is ready.
-
-The `e2e/docker-test.sh` script automates the full flow: build, test, and verify zero-trust by scanning backend logs for credential leaks.
+Build success remains distinct from a healthy live container rollout. Follow
+`docs/observability.md` for deployment/image/health verification.
 
 ## Interface Design System
 

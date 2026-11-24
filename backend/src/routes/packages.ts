@@ -3,8 +3,9 @@ import fs from 'fs';
 import path from 'path';
 import { config } from '../config.js';
 import { MIN_ACCOUNT_HASH_LENGTH } from '../config.js';
-import { getAllTasks } from '../services/downloadManager.js';
+import { deleteTask, getAllTasks } from '../services/downloadManager.js';
 import { getIdParam } from '../utils/route.js';
+import { streamPackageFile } from '../utils/packageFile.js';
 import type { PackageInfo } from '../types/index.js';
 
 const router = Router();
@@ -86,13 +87,7 @@ router.get('/packages/:id/file', (req: Request, res: Response) => {
   const safeVersion = sanitizeFilename(task.software.version);
   const fileName = `${safeName}_${safeVersion}.ipa`;
   res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-  res.setHeader('Content-Type', 'application/octet-stream');
-
-  const stats = fs.statSync(resolvedPath);
-  res.setHeader('Content-Length', stats.size);
-
-  const stream = fs.createReadStream(resolvedPath);
-  stream.pipe(res);
+  streamPackageFile(req, res, resolvedPath, task.id);
 });
 
 // Delete a package (requires accountHash)
@@ -125,21 +120,9 @@ router.delete('/packages/:id', (req: Request, res: Response) => {
     return;
   }
 
-  if (fs.existsSync(resolvedPath)) {
-    fs.unlinkSync(resolvedPath);
-
-    // Clean up empty parent directories
-    let dir = path.dirname(resolvedPath);
-    while (dir !== packagesBase && dir.startsWith(packagesBase)) {
-      const contents = fs.readdirSync(dir);
-      if (contents.length === 0) {
-        fs.rmdirSync(dir);
-        dir = path.dirname(dir);
-      } else {
-        break;
-      }
-    }
-  }
+  // File deletion, task metadata, and generation invalidation share one owner.
+  // An in-flight compiler must not recreate a package after this API succeeds.
+  deleteTask(id);
 
   res.json({ success: true });
 });
