@@ -118,6 +118,53 @@ export const diagnosticErrorCodes = [
   'BUSY',
 ] as const;
 
+export const diagnosticPurchaseBranches = [
+  'http_error',
+  'invalid_plist',
+  'invalid_failure_type',
+  'invalid_customer_message',
+  'terms_required',
+  'device_verification',
+  'token_expired',
+  'subscription_required',
+  'dialog_present',
+  'action_present',
+  'invalid_status',
+  'unavailable',
+  'already_owned',
+  'conflicting_message',
+  'failure_code',
+  'customer_message',
+  'missing_success_document',
+  'missing_success_status',
+  'success',
+] as const;
+export const diagnosticFailureTypeKinds = ['missing', 'empty', 'numeric', 'text', 'invalid'] as const;
+export const diagnosticStatusKinds = ['missing', 'zero', 'nonzero', 'text', 'invalid'] as const;
+export const diagnosticDialogKinds = [
+  'missing',
+  'authorization',
+  'confirmation',
+  'acknowledgement',
+  'error',
+  'other',
+] as const;
+export const diagnosticActionKinds = ['missing', 'Goto', 'Buy', 'Download', 'SignIn', 'other'] as const;
+
+/** Syntax for Apple protocol identifiers only; never pass arbitrary messages here. */
+export function validAppleDialogCode(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length > 160) return false;
+  const segments = value.split('.');
+  if (segments.length < 2 || !['MZCommerce', 'MZFinance', 'MZCommerceInAppBuy'].includes(segments[0])) return false;
+  return segments.slice(1).every(
+    (segment) =>
+      segment.length >= 1 &&
+      segment.length <= 48 &&
+      // Equality enforces the true end of the string, including after line breaks.
+      /^[A-Z][A-Za-z]*(?:[0-9]{1,2})?$/.exec(segment)?.[0] === segment,
+  );
+}
+
 export interface DiagnosticDetails {
   httpStatus?: number;
   attempt?: number;
@@ -130,6 +177,15 @@ export interface DiagnosticDetails {
   alreadyOwned?: boolean;
   codeRequired?: boolean;
   statePresent?: boolean;
+  dialogCode?: string;
+  purchaseBranch?: (typeof diagnosticPurchaseBranches)[number];
+  failureTypeKind?: (typeof diagnosticFailureTypeKinds)[number];
+  statusKind?: (typeof diagnosticStatusKinds)[number];
+  dialogPresent?: boolean;
+  actionPresent?: boolean;
+  messagePresent?: boolean;
+  dialogKind?: (typeof diagnosticDialogKinds)[number];
+  actionKind?: (typeof diagnosticActionKinds)[number];
   action?: 'RP' | 'SP';
   responseType?: 'purchaseSuccess' | 'buyProductFailure' | 'other' | 'missing';
   dialog?:
@@ -167,6 +223,15 @@ const detailFields = [
   'action',
   'responseType',
   'dialog',
+  'dialogCode',
+  'purchaseBranch',
+  'failureTypeKind',
+  'statusKind',
+  'dialogPresent',
+  'actionPresent',
+  'messagePresent',
+  'dialogKind',
+  'actionKind',
 ] as const;
 const allowedFields = new Set<string>([...requiredFields, ...detailFields]);
 const stringDetails: Record<string, readonly string[]> = {
@@ -182,6 +247,11 @@ const stringDetails: Record<string, readonly string[]> = {
     'other',
     'missing',
   ],
+  purchaseBranch: diagnosticPurchaseBranches,
+  failureTypeKind: diagnosticFailureTypeKinds,
+  statusKind: diagnosticStatusKinds,
+  dialogKind: diagnosticDialogKinds,
+  actionKind: diagnosticActionKinds,
 };
 
 export function validDiagnosticId(value: unknown): value is string {
@@ -205,8 +275,13 @@ function validDetail(key: string, value: unknown): boolean {
     return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= maximum;
   }
   if (key === 'errorCode') return validDiagnosticErrorCode(value);
+  if (key === 'dialogCode') return validAppleDialogCode(value);
   if (Object.hasOwn(stringDetails, key)) return includes(stringDetails[key], value);
-  return ['alreadyOwned', 'codeRequired', 'statePresent'].includes(key) && typeof value === 'boolean';
+  return (
+    ['alreadyOwned', 'codeRequired', 'statePresent', 'dialogPresent', 'actionPresent', 'messagePresent'].includes(
+      key,
+    ) && typeof value === 'boolean'
+  );
 }
 
 /** Reject unknown fields and arbitrary strings before a browser event reaches stdout. */

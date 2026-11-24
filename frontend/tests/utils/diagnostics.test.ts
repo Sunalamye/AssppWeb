@@ -1,13 +1,36 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { enqueueDiagnosticEvent } from '../../src/utils/diagnosticTransport';
 import {
+  validAppleDialogCode as validBackendAppleDialogCode,
+  validateDiagnosticEvent,
+} from '../../../backend/src/utils/diagnostics';
+import {
   attachDiagnosticId,
   clearDiagnosticEvents,
   createDiagnosticFlow,
+  diagnosticActionKinds,
+  diagnosticDialogKinds,
+  diagnosticFailureTypeKinds,
+  diagnosticPurchaseBranches,
+  diagnosticStatusKinds,
   errorDiagnosticDetails,
   getDiagnosticEvents,
   getDiagnosticId,
+  safeDiagnosticDetails,
+  validAppleDialogCode,
 } from '../../src/utils/diagnostics';
+
+const baseEvent = {
+  schema: 1,
+  flowId: '11a83a6c-730d-4a0f-95f1-98e4a144a2ad',
+  sequence: 1,
+  flow: 'license',
+  stage: 'purchase',
+  outcome: 'failure',
+  at: 1_800_000_000_000,
+};
+
+const longestDialogCode = ['MZCommerce', 'A'.repeat(48), 'B'.repeat(48), 'C'.repeat(48), 'DD'].join('.');
 
 describe('safe diagnostics', () => {
   beforeEach(() => {
@@ -64,6 +87,47 @@ describe('safe diagnostics', () => {
     expect(errorDiagnosticDetails(new DOMException('private', 'TimeoutError'))).toEqual({ reason: 'timeout' });
   });
 
+  it('retains only the classified purchase facts in memory, local storage, and transport', () => {
+    const flow = createDiagnosticFlow('license');
+    const details = {
+      dialog: 'other',
+      dialogCode: 'MZCommerceInAppBuy.Authorization.Required12',
+      purchaseBranch: 'dialog_present',
+      failureTypeKind: 'empty',
+      statusKind: 'missing',
+      dialogPresent: true,
+      actionPresent: false,
+      messagePresent: true,
+      dialogKind: 'authorization',
+      actionKind: 'missing',
+    } as const;
+    flow.log('purchase', 'failure', {
+      ...details,
+      customerMessage: 'PRIVATE_CUSTOMER_MESSAGE',
+      metrics: { dialogId: 'PRIVATE_RAW_METRICS' },
+      url: 'https://example.com/?password=PRIVATE_PASSWORD',
+    } as never);
+    const [event] = getDiagnosticEvents();
+    expect(event).toMatchObject(details);
+    expect(validateDiagnosticEvent(event)).toEqual(event);
+    expect(enqueueDiagnosticEvent).toHaveBeenCalledWith(event);
+    expect(JSON.parse(localStorage.getItem('asspp-diagnostics-v1')!)).toEqual([event]);
+    expect(JSON.stringify(event)).not.toContain('PRIVATE_');
+    expect(Object.keys(event).sort()).toEqual([...Object.keys(baseEvent), ...Object.keys(details)].sort());
+
+    const error = Object.assign(new Error('PRIVATE_ERROR_MESSAGE'), {
+      diagnostics: {
+        ...details,
+        dialogCode: 'MZCommerce.PRIVATE_TOKEN',
+        customerMessage: 'PRIVATE_CUSTOMER_MESSAGE',
+      },
+    });
+    const errorDetails = errorDiagnosticDetails(error);
+    expect(errorDetails.purchaseBranch).toBe('dialog_present');
+    expect(errorDetails).not.toHaveProperty('dialogCode');
+    expect(JSON.stringify(errorDetails)).not.toContain('PRIVATE_');
+  });
+
   it('preserves the original error identity while making its flow discoverable', () => {
     const flow = createDiagnosticFlow('download');
     const error = new Error('original failure');
@@ -85,5 +149,143 @@ describe('safe diagnostics', () => {
     } finally {
       localStorage.setItem = original;
     }
+  });
+});
+
+describe('purchase diagnostic schema agreement', () => {
+  it.each([
+    'MZCommerce.CountryMismatch',
+    'MZCommerce.ExpiredPasswordToken',
+    'MZCommerce.SystemError',
+    'MZFinance.Account.NotFound2',
+    'MZCommerceInAppBuy.Authorization.Required12',
+    'MZCommerce.A',
+    'MZCommerce.HTTPError',
+    `MZCommerce.${'A'.repeat(48)}`,
+    longestDialogCode,
+  ])('accepts the same bounded Apple identifier on both ends: %s', (dialogCode) => {
+    expect(validAppleDialogCode(dialogCode)).toBe(true);
+    expect(validBackendAppleDialogCode(dialogCode)).toBe(true);
+    expect(safeDiagnosticDetails({ dialogCode })).toEqual({ dialogCode });
+    expect(validateDiagnosticEvent({ ...baseEvent, dialogCode })).toEqual({ ...baseEvent, dialogCode });
+  });
+
+  it.each([
+    undefined,
+    null,
+    1,
+    true,
+    {},
+    ['MZCommerce.SystemError'],
+    new String('MZCommerce.SystemError'),
+    '',
+    'MZCommerce',
+    'MZCommerce.',
+    'MZCommerce..SystemError',
+    'MZCommerce.SystemError.',
+    'MZCommerceOther.SystemError',
+    'mzcommerce.SystemError',
+    'OtherNamespace.SystemError',
+    'MZCommerce.systemError',
+    'MZCommerce.2SystemError',
+    'MZCommerce.System2Error',
+    'MZCommerce.SystemError123',
+    'MZCommerce.private@example.com',
+    'https://MZCommerce.SystemError',
+    'MZCommerce.SystemError/private',
+    'MZCommerce.SystemError\\private',
+    'MZCommerce.SystemError?token=PRIVATE_TOKEN',
+    'MZCommerce.SystemError#PRIVATE_TOKEN',
+    'MZCommerce.SystemError:PRIVATE_TOKEN',
+    'MZCommerce.SystemError%0A',
+    'MZCommerce.SystemError"',
+    "MZCommerce.SystemError'",
+    ' MZCommerce.SystemError',
+    'MZCommerce.SystemError ',
+    'MZCommerce.System Error',
+    'MZCommerce.SystemError\n',
+    'MZCommerce.SystemError\r\n',
+    'MZCommerce.SystemError\t',
+    'MZCommerce.SystemError\0',
+    'MZCommerce.SystemError\u007f',
+    'MZCommerce.SystemError\u2028',
+    'MZCommerce.SystemError\u2029',
+    'MZCommerce.SystemError\u00a0',
+    'MZCommerce.錯誤',
+    'MZCommerce.Érror',
+    'MZCommerce.SystemError🔒',
+    'MZCommerce.Abc+Def/Ghi=',
+    'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwcml2YXRlIn0.signature',
+    'PROOF_FAILED',
+    `MZCommerce.${'A'.repeat(49)}`,
+    `${longestDialogCode}D`,
+  ])('rejects the same malformed or private-looking identifier on both ends: %j', (dialogCode) => {
+    expect(validAppleDialogCode(dialogCode)).toBe(false);
+    expect(validBackendAppleDialogCode(dialogCode)).toBe(false);
+    expect(safeDiagnosticDetails({ dialogCode } as never)).toEqual({});
+    expect(validateDiagnosticEvent({ ...baseEvent, dialogCode })).toBeUndefined();
+  });
+
+  it('enforces the exact inclusive identifier limits', () => {
+    expect(longestDialogCode).toHaveLength(160);
+    expect(validAppleDialogCode(longestDialogCode)).toBe(true);
+    expect(validAppleDialogCode(`${longestDialogCode}D`)).toBe(false);
+    expect(validAppleDialogCode(`MZFinance.${'A'.repeat(46)}12`)).toBe(true);
+    expect(validAppleDialogCode(`MZFinance.${'A'.repeat(47)}12`)).toBe(false);
+  });
+
+  it('accepts every new enum value and strict boolean on both ends', () => {
+    const fields = {
+      purchaseBranch: diagnosticPurchaseBranches,
+      failureTypeKind: diagnosticFailureTypeKinds,
+      statusKind: diagnosticStatusKinds,
+      dialogKind: diagnosticDialogKinds,
+      actionKind: diagnosticActionKinds,
+      dialogPresent: [true, false],
+      actionPresent: [true, false],
+      messagePresent: [true, false],
+    };
+    for (const [key, values] of Object.entries(fields)) {
+      for (const value of values) {
+        const details = { [key]: value };
+        expect(safeDiagnosticDetails(details), `${key}: ${String(value)}`).toEqual(details);
+        expect(validateDiagnosticEvent({ ...baseEvent, ...details })).toEqual({ ...baseEvent, ...details });
+      }
+    }
+  });
+
+  it('filters malformed classification values in the browser and rejects them at the server', () => {
+    for (const key of [
+      'purchaseBranch',
+      'failureTypeKind',
+      'statusKind',
+      'dialogKind',
+      'actionKind',
+      'dialogPresent',
+      'actionPresent',
+      'messagePresent',
+    ]) {
+      for (const value of ['PRIVATE_TOKEN', 'true', 0, 1, null, { password: 'PRIVATE_PASSWORD' }, ['PRIVATE_TOKEN']]) {
+        const details = { [key]: value };
+        expect(safeDiagnosticDetails(details), `${key}: ${JSON.stringify(value)}`).toEqual({});
+        expect(validateDiagnosticEvent({ ...baseEvent, ...details })).toBeUndefined();
+      }
+    }
+  });
+
+  it('keeps the legacy dialog enum unchanged while adding optional dialogCode', () => {
+    for (const dialog of [
+      'MZCommerce.CountryMismatch',
+      'MZCommerce.ExpiredPasswordToken',
+      'MZCommerce.SystemError',
+      'other',
+      'missing',
+    ]) {
+      expect(safeDiagnosticDetails({ dialog } as never)).toEqual({ dialog });
+      expect(validateDiagnosticEvent({ ...baseEvent, dialog })).toEqual({ ...baseEvent, dialog });
+    }
+    expect(safeDiagnosticDetails({ dialog: 'MZFinance.Account.NotFound2' } as never)).toEqual({});
+    expect(validateDiagnosticEvent({ ...baseEvent, dialog: 'MZFinance.Account.NotFound2' })).toBeUndefined();
+    expect(validateDiagnosticEvent(baseEvent)).toEqual(baseEvent);
   });
 });

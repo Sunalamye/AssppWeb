@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { buildPlist, parsePlist } from '../../src/apple/plist';
+import * as plist from '../../src/apple/plist';
 import { purchaseApp, PurchaseError } from '../../src/apple/purchase';
 import { appleRequest } from '../../src/apple/request';
 import { clearDiagnosticEvents, getDiagnosticEvents } from '../../src/utils/diagnostics';
@@ -51,6 +52,7 @@ describe('apple/purchase', () => {
       alreadyOwned: true,
     });
     expect(appleRequest).toHaveBeenCalledTimes(1);
+    expect(getDiagnosticEvents().at(-1)).toMatchObject({ outcome: 'success', purchaseBranch: 'already_owned' });
   });
 
   it('reports a fresh purchase as not previously owned', async () => {
@@ -60,6 +62,17 @@ describe('apple/purchase', () => {
       alreadyOwned: false,
     });
     expect(vi.mocked(appleRequest).mock.calls[0][0].headers?.['X-Apple-Store-Front']).toBe('143441-1');
+    expect(getDiagnosticEvents().at(-1)).toMatchObject({
+      outcome: 'success',
+      purchaseBranch: 'success',
+      failureTypeKind: 'missing',
+      statusKind: 'zero',
+      dialogPresent: false,
+      actionPresent: false,
+      messagePresent: false,
+      dialogKind: 'missing',
+      actionKind: 'missing',
+    });
   });
 
   it('preserves the complete storefront returned by native authentication', async () => {
@@ -89,6 +102,7 @@ describe('apple/purchase', () => {
     const error = await purchaseApp(account, app).catch((error) => error);
     expect(error).toBeInstanceOf(PurchaseError);
     expect(error.diagnostics.reason).toBe('terms_required');
+    expect(error.diagnostics.purchaseBranch).toBe('terms_required');
     expect(error.message).toContain('HTTP 200');
     expect(error.message).not.toContain('PRIVATE_QUERY');
     expect(JSON.stringify(getDiagnosticEvents())).not.toContain('PRIVATE_QUERY');
@@ -128,7 +142,131 @@ describe('apple/purchase', () => {
     const error = await purchaseApp(account, app).catch((error) => error);
     expect(error).toBeInstanceOf(PurchaseError);
     expect(error.diagnostics.reason).toBe(reason);
+    expect(error.diagnostics.purchaseBranch).toBe(reason);
     expect(appleRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it('identifies an unknown public Apple dialog without a purchase document or failure code', async () => {
+    // Synthetic identifier: the previous log retained only "other", so the real
+    // identifier from that response cannot be reconstructed from those events.
+    const dialogCode = 'MZCommerce.FixtureAuthorizationRequired';
+    respondWith({
+      metrics: { dialogId: dialogCode, privateAccount: account.email },
+      dialog: {
+        kind: 'authorization',
+        explanation: 'PRIVATE_ACCOUNT_MESSAGE',
+        okButtonAction: { kind: 'SignIn', url: 'https://example.invalid/?token=PRIVATE_ACTION_TOKEN' },
+      },
+      passwordToken: 'PRIVATE_RESPONSE_TOKEN',
+    });
+
+    const error = await purchaseApp(account, app).catch((error) => error);
+    expect(error).toBeInstanceOf(PurchaseError);
+    expect(error.diagnostics).toMatchObject({
+      httpStatus: 200,
+      responseType: 'missing',
+      dialog: 'other',
+      dialogCode,
+      reason: 'unexpected_response',
+      purchaseBranch: 'dialog_present',
+      failureTypeKind: 'missing',
+      statusKind: 'missing',
+      dialogPresent: true,
+      actionPresent: false,
+      messagePresent: true,
+      dialogKind: 'authorization',
+      actionKind: 'missing',
+    });
+    expect(error.message).toContain(`dialog=${dialogCode}`);
+    expect(error.message).toContain('branch=dialog_present');
+    expect(error.message).toContain('status=missing');
+    expect(appleRequest).toHaveBeenCalledTimes(1);
+    const events = getDiagnosticEvents();
+    expect(events.at(-1)).toMatchObject({ outcome: 'failure', purchaseBranch: 'dialog_present', dialogCode });
+    expect(events.some((event) => event.outcome === 'retry' || event.outcome === 'success')).toBe(false);
+    const serialized = JSON.stringify(events);
+    for (const secret of [
+      account.email,
+      account.passwordToken,
+      'PRIVATE_ACCOUNT_MESSAGE',
+      'PRIVATE_ACTION_TOKEN',
+      'PRIVATE_RESPONSE_TOKEN',
+    ])
+      expect(serialized).not.toContain(secret);
+  });
+
+  it.each([
+    [{ failureType: {} }, 'invalid_failure_type'],
+    [{ customerMessage: [] }, 'invalid_customer_message'],
+    [{ dialog: {} }, 'dialog_present'],
+    [{ action: { kind: 'Goto' } }, 'action_present'],
+    [{ jingleDocType: 'purchaseSuccess', status: '0' }, 'invalid_status'],
+    [{ failureType: '5002', customerMessage: 'Account action required' }, 'conflicting_message'],
+    [{ failureType: '9610', customerMessage: 'Account action required' }, 'failure_code'],
+    [{ customerMessage: 'Account action required' }, 'customer_message'],
+    [{ status: 0 }, 'missing_success_document'],
+    [{ jingleDocType: 'purchaseSuccess' }, 'missing_success_status'],
+  ])('records the exact rejection branch for response %#', async (dict, purchaseBranch) => {
+    respondWith(dict as Record<string, unknown>);
+    const error = await purchaseApp(account, app).catch((error) => error);
+    expect(error).toBeInstanceOf(PurchaseError);
+    expect(error.diagnostics.purchaseBranch).toBe(purchaseBranch);
+    expect(getDiagnosticEvents().at(-1)).toMatchObject({ outcome: 'failure', purchaseBranch });
+    expect(appleRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it('retains only recognized action kinds and drops private dialog identifiers', async () => {
+    respondWith({
+      metrics: { dialogId: 'MZCommerce.PRIVATE_TOKEN_123456789' },
+      dialog: { kind: 'PRIVATE_DIALOG_KIND', message: 'PRIVATE_DIALOG_MESSAGE' },
+      action: { kind: 'SignIn', url: 'https://example.invalid/?token=PRIVATE_ACTION_URL' },
+    });
+    const error = await purchaseApp(account, app).catch((error) => error);
+    expect(error.diagnostics).toMatchObject({
+      dialog: 'other',
+      dialogPresent: true,
+      actionPresent: true,
+      dialogKind: 'other',
+      actionKind: 'SignIn',
+      messagePresent: true,
+      purchaseBranch: 'dialog_present',
+    });
+    expect(error.diagnostics).not.toHaveProperty('dialogCode');
+    expect(error.message).toContain('dialog=other');
+    expect(error.message).not.toContain('PRIVATE_TOKEN_123456789');
+    expect(JSON.stringify(getDiagnosticEvents())).not.toContain('PRIVATE_');
+  });
+
+  it.each(['MZCommerce.FixtureDialog\n', ' MZCommerce.FixtureDialog', 'MZCommerce.FixtureDialog%0A'])(
+    'does not normalize an invalid raw dialog identifier into a permitted code %#',
+    async (dialogId) => {
+      respondWith({ metrics: { dialogId } });
+      const error = await purchaseApp(account, app).catch((error) => error);
+      expect(error.diagnostics).toMatchObject({ dialog: 'other', purchaseBranch: 'missing_success_document' });
+      expect(error.diagnostics).not.toHaveProperty('dialogCode');
+      expect(error.message).not.toContain('MZCommerce.FixtureDialog');
+      expect(JSON.stringify(getDiagnosticEvents())).not.toContain('MZCommerce.FixtureDialog');
+    },
+  );
+
+  it.each([null, false, {}])('distinguishes present dialog/action values from absent fields %#', async (value) => {
+    respondWith({});
+    // Exercise field presence independently of XML's supported value types.
+    const parser = vi.spyOn(plist, 'parsePlist').mockReturnValueOnce({ dialog: value, action: value });
+    try {
+      const error = await purchaseApp(account, app).catch((error) => error);
+      expect(error.diagnostics).toMatchObject({
+        dialogPresent: true,
+        actionPresent: true,
+        messagePresent: false,
+        dialogKind: 'missing',
+        actionKind: 'missing',
+        purchaseBranch: 'dialog_present',
+      });
+      expect(appleRequest).toHaveBeenCalledTimes(1);
+    } finally {
+      parser.mockRestore();
+    }
   });
 
   it.each([204, 302, 401, 500])('never accepts a success-shaped non-200 HTTP %i response', async (status) => {
@@ -141,6 +279,13 @@ describe('apple/purchase', () => {
     });
     await expect(purchaseApp(account, app)).rejects.toThrow(`HTTP ${status}`);
     expect(appleRequest).toHaveBeenCalledTimes(1);
+    expect(getDiagnosticEvents().at(-1)).toMatchObject({
+      outcome: 'failure',
+      purchaseBranch: 'http_error',
+      httpStatus: status,
+      responseType: 'purchaseSuccess',
+      statusKind: 'zero',
+    });
   });
 
   it('does not call HTTP 500 an already-owned license', async () => {
@@ -152,7 +297,50 @@ describe('apple/purchase', () => {
       body: buildPlist({ failureType: '5002' }),
     });
     await expect(purchaseApp(account, app)).rejects.toThrow('HTTP 500');
+    expect(getDiagnosticEvents().at(-1)).toMatchObject({ purchaseBranch: 'http_error', errorCode: '5002' });
   });
+
+  it.each([
+    [{}, 'missing', 'missing'],
+    [{ failureType: '  ', status: 0 }, 'empty', 'zero'],
+    [{ failureType: 2059, status: 1 }, 'numeric', 'nonzero'],
+    [{ failureType: 'PRIVATE_FAILURE_TYPE', status: 'PRIVATE_STATUS' }, 'text', 'text'],
+    [{ failureType: false, status: [] }, 'invalid', 'invalid'],
+  ])(
+    'classifies non-200 response shapes without interpreting them as success or retry %#',
+    async (shape, failureTypeKind, statusKind) => {
+      vi.mocked(appleRequest).mockResolvedValue({
+        status: 503,
+        statusText: '',
+        headers: {},
+        rawHeaders: [],
+        body: buildPlist({
+          ...(shape as Record<string, unknown>),
+          jingleDocType: 'buyProductFailure',
+          metrics: { dialogId: 'MZFinance.FixtureServiceUnavailable' },
+          customerMessage: 'PRIVATE_RESPONSE_MESSAGE',
+          action: { kind: 'PRIVATE_ACTION_KIND', url: 'https://example.invalid/?token=PRIVATE_URL' },
+        }),
+      });
+      const error = await purchaseApp(account, app).catch((error) => error);
+      expect(error).toBeInstanceOf(PurchaseError);
+      expect(error.diagnostics).toMatchObject({
+        httpStatus: 503,
+        purchaseBranch: 'http_error',
+        reason: 'http_error',
+        responseType: 'buyProductFailure',
+        dialogCode: 'MZFinance.FixtureServiceUnavailable',
+        failureTypeKind,
+        statusKind,
+        actionKind: 'other',
+        messagePresent: true,
+      });
+      expect(appleRequest).toHaveBeenCalledTimes(1);
+      const events = getDiagnosticEvents();
+      expect(events.some((event) => event.outcome === 'success' || event.outcome === 'retry')).toBe(false);
+      expect(JSON.stringify(events)).not.toContain('PRIVATE_');
+    },
+  );
 
   it.each([
     { jingleDocType: 'purchaseSuccess' },
@@ -182,6 +370,7 @@ describe('apple/purchase', () => {
     const error = await purchaseApp(account, app).catch((error) => error);
     expect(error).toBeInstanceOf(PurchaseError);
     expect(error.message).toContain('HTTP 200');
+    expect(error.diagnostics.purchaseBranch).toBe('invalid_plist');
     expect(error.message).not.toContain('PRIVATE_RESPONSE');
     expect(JSON.stringify(getDiagnosticEvents())).not.toContain('PRIVATE_RESPONSE');
   });
@@ -221,7 +410,10 @@ describe('apple/purchase', () => {
   it('bounds pricing retries and does not mutate the caller account', async () => {
     respondWith({ failureType: '2059' });
     const original = JSON.stringify(account);
-    await expect(purchaseApp(account, app)).rejects.toMatchObject({ code: '2059' });
+    await expect(purchaseApp(account, app)).rejects.toMatchObject({
+      code: '2059',
+      diagnostics: { purchaseBranch: 'unavailable' },
+    });
     expect(appleRequest).toHaveBeenCalledTimes(2);
     expect(JSON.stringify(account)).toBe(original);
   });

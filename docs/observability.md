@@ -6,7 +6,7 @@ This document describes the stateful paths reviewed in the November 2026 authent
 
 1. Find the `[flow: <UUID>]` shown with the error. The same ID follows account renewal, device proof, purchase, download discovery, and backend enqueue.
 2. In Cloudflare Observability, select the **Containers** dataset and the `assppweb-assppcontainer` application. Find `asspp.diagnostic` events containing that flow ID. Worker invocation logs remain useful for request status and deployment/runtime errors.
-3. Read `stage`, `outcome`, `reason`, `httpStatus`, and `errorCode`. Browser `sequence` orders events within its flow; server/helper `requestId` identifies individual backend operations. Different emitters have independent sequence counters. Use timestamps plus source/request ID when combining them.
+3. Read `stage`, `outcome`, `reason`, `httpStatus`, and `errorCode`. For purchase failures, also read `purchaseBranch` and the response-shape fields below. Browser `sequence` orders events within its flow; server/helper `requestId` identifies individual backend operations. Different emitters have independent sequence counters. Use timestamps plus source/request ID when combining them.
 4. If a browser log could not reach the server, open **Settings → Diagnostics → Export diagnostics**. The export contains the latest 200 safe events retained by that browser.
 
 Container logs use the application's UUID as `$metadata.service`, not its display name. When using the Cloudflare telemetry API, discover this value through `/workers/observability/telemetry/values` or `/workers/observability/usage` and query the `containers` dataset. A Worker and its Durable Object can emit two records for the same request; compare trace/ray IDs before counting them as separate attempts.
@@ -33,6 +33,25 @@ Container logs use the application's UUID as `$metadata.service`, not its displa
 This example means the browser received an HTTP 200 response that requires a user action. It does **not** mean the purchase succeeded. Browser diagnostics are client reports, not an authorization mechanism. Only the protocol's explicit success criteria can advance an operation to success.
 
 The diagnostic upload endpoint itself returns HTTP 204 when it accepts an event. This is normal and is separate from an Apple authentication response with `endpoint: "native_auth"` and `httpStatus: 204`.
+
+### Distinguishing an unknown purchase response
+
+An operation can complete authentication and save the renewed account, then receive HTTP 200 from `buyProduct` without receiving a license. Inspect the first `purchase` failure rather than treating the preceding authentication success as purchase success.
+
+| Field                                              | What it establishes                                                                                                                                                                                         |
+| -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `purchaseBranch`                                   | The precise validation or interpretation branch, such as `dialog_present`, `invalid_status`, or `missing_success_document`.                                                                                 |
+| `dialogCode`                                       | A bounded Apple-style identifier copied only from `metrics.dialogId`, when it matches the permitted namespace and identifier syntax. It is a diagnostic label, not permission to follow an action or retry. |
+| `failureTypeKind`                                  | Whether `failureType` was missing, empty, numeric, text, or an invalid type. An absent numeric `errorCode` alone does not establish that Apple omitted `failureType`.                                       |
+| `statusKind`                                       | Whether the status was missing, numeric zero, a nonzero number, text, or an invalid type. The string `"0"` does not satisfy numeric success.                                                                |
+| `dialogPresent`, `actionPresent`, `messagePresent` | Presence of the corresponding response structure or a usable message, without uploading its content.                                                                                                        |
+| `dialogKind`, `actionKind`                         | Fixed categories for the dialog and top-level action. Unknown values remain `other`.                                                                                                                        |
+
+The older `dialog` field classifies `metrics.dialogId`; `dialog: "missing"` does not mean the response lacks a `dialog` object. Likewise, `responseType: "missing"` alone cannot distinguish an omitted document type from an empty or invalid value. Use the branch and shape fields together.
+
+Non-200 responses may also contain a valid plist with useful error classifications. Those classifications are retained, but the operation still fails at `http_error`: a success-shaped body or familiar Apple error code cannot turn an HTTP failure into success or authorize a retry.
+
+Already uploaded events cannot recover response fields that an older client omitted. An open tab also keeps its loaded JavaScript after a deployment. Reload the page before a post-deployment acceptance test, then verify that the browser events and bag/helper requests share one flow ID. Do not clear account storage merely to update the page.
 
 ## State audit and guards
 
@@ -70,7 +89,8 @@ Cross-tab account coordination requires Web Locks; browsers without that API ret
 
 ## Data contract and credential boundary
 
-- `frontend/src/utils/diagnostics.ts` constructs events from an explicit allowlist. Stage, outcome, reason, endpoint, mode, response type, and dialog classifications are enumerated. Error codes are bounded numeric codes or known helper codes.
+- `frontend/src/utils/diagnostics.ts` constructs events from an explicit allowlist. Stage, outcome, reason, endpoint, mode, response type, dialog classifications, purchase branches, and response-shape categories are enumerated. Error codes are bounded numeric codes or known helper codes.
+- `dialogCode` accepts only `MZCommerce`, `MZFinance`, or `MZCommerceInAppBuy` followed by bounded, dot-separated ASCII identifier segments, with a 160-character total limit. Both client and server validate the complete value. URL, email, whitespace, control characters, and arbitrary response/message fields are not accepted as dialog codes. A syntactically valid code is still an unverified client report and does not establish its business meaning.
 - `POST /api/diagnostics` validates the same schema before writing a JSON line. It rejects unknown fields, oversized/invalid JSON, and cross-site browser requests, and uses the existing site access check. The route's 4 KiB parser runs before the application's large package-metadata parser.
 - The receiver has a bounded token bucket: burst 240, refill 4 events/second, at most 1,024 client buckets, and a 10-minute idle expiry. A shared proxy address can share a bucket. Rate limiting affects diagnostic delivery, not account operations.
 - Frontend transport has at most two concurrent uploads, a 200-event queue, and a five-second upload deadline. It does not retry business operations. Local history retains the latest 200 events and remains exportable if logging is unavailable. These are bounded diagnostics, not a durable offline event queue.

@@ -7,6 +7,7 @@ import {
   createDiagnosticFlow,
   errorDiagnosticDetails,
   safeDiagnosticDetails,
+  validAppleDialogCode,
 } from '../utils/diagnostics';
 import { purchaseAPIHost } from './config';
 import type { AppleResponse } from './request';
@@ -51,19 +52,76 @@ function failureCode(value: unknown): string {
   return text(value);
 }
 
+function failureTypeKind(value: unknown): DiagnosticDetails['failureTypeKind'] {
+  if (value === undefined) return 'missing';
+  if (typeof value === 'number') return Number.isSafeInteger(value) ? 'numeric' : 'invalid';
+  if (typeof value !== 'string') return 'invalid';
+  const code = value.trim();
+  if (!code) return 'empty';
+  return /^-?\d+$/.test(code) ? 'numeric' : 'text';
+}
+
+function statusKind(value: unknown): DiagnosticDetails['statusKind'] {
+  if (value === undefined) return 'missing';
+  if (typeof value === 'string') return 'text';
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 'invalid';
+  return value === 0 ? 'zero' : 'nonzero';
+}
+
+function dialogKind(value: unknown): DiagnosticDetails['dialogKind'] {
+  if (value === undefined || (typeof value === 'string' && !value.trim())) return 'missing';
+  const kind = text(value);
+  switch (kind) {
+    case 'authorization':
+    case 'confirmation':
+    case 'acknowledgement':
+    case 'error':
+      return kind;
+    default:
+      return 'other';
+  }
+}
+
+function actionKind(value: unknown): DiagnosticDetails['actionKind'] {
+  if (value === undefined || (typeof value === 'string' && !value.trim())) return 'missing';
+  const kind = text(value);
+  switch (kind) {
+    case 'Goto':
+    case 'Buy':
+    case 'Download':
+    case 'SignIn':
+      return kind;
+    default:
+      return 'other';
+  }
+}
+
 function responseDetails(response: AppleResponse, dict: PurchaseDictionary = {}): DiagnosticDetails {
   const metrics = dictionary(dict.metrics) ? dict.metrics : {};
   const document = text(dict.jingleDocType);
-  const dialog = text(metrics.dialogId);
+  const dialogCode = metrics.dialogId;
+  const classifiedDialogCode = text(dialogCode);
+  const dialog = dictionary(dict.dialog) ? dict.dialog : {};
+  const action = dictionary(dict.action) ? dict.action : {};
   return safeDiagnosticDetails({
     endpoint: 'purchase',
     httpStatus: response.status,
     errorCode: failureCode(dict.failureType),
+    failureTypeKind: failureTypeKind(dict.failureType),
+    statusKind: statusKind(dict.status),
+    dialogPresent: Object.prototype.hasOwnProperty.call(dict, 'dialog'),
+    actionPresent: Object.prototype.hasOwnProperty.call(dict, 'action'),
+    messagePresent: !!(text(dialog.explanation) || text(dialog.message) || text(dict.customerMessage)),
+    dialogKind: dialogKind(dialog.kind),
+    actionKind: actionKind(action.kind),
+    ...(validAppleDialogCode(dialogCode) ? { dialogCode } : {}),
     responseType:
       document === 'purchaseSuccess' || document === 'buyProductFailure' ? document : document ? 'other' : 'missing',
-    dialog: ['MZCommerce.CountryMismatch', 'MZCommerce.ExpiredPasswordToken', 'MZCommerce.SystemError'].includes(dialog)
-      ? (dialog as DiagnosticDetails['dialog'])
-      : dialog
+    dialog: ['MZCommerce.CountryMismatch', 'MZCommerce.ExpiredPasswordToken', 'MZCommerce.SystemError'].includes(
+      classifiedDialogCode,
+    )
+      ? (classifiedDialogCode as DiagnosticDetails['dialog'])
+      : classifiedDialogCode
         ? 'other'
         : 'missing',
   });
@@ -73,26 +131,33 @@ function purchaseFailure(message: string, details: DiagnosticDetails, code?: str
   const facts = [`HTTP ${details.httpStatus ?? 0}`];
   if (details.errorCode) facts.push(`code=${details.errorCode}`);
   if (details.responseType) facts.push(`response=${details.responseType}`);
-  if (details.dialog && details.dialog !== 'missing') facts.push(`dialog=${details.dialog}`);
+  if (validAppleDialogCode(details.dialogCode)) facts.push(`dialog=${details.dialogCode}`);
+  else if (details.dialog && details.dialog !== 'missing') facts.push(`dialog=${details.dialog}`);
+  if (details.purchaseBranch) facts.push(`branch=${details.purchaseBranch}`);
+  if (details.statusKind) facts.push(`status=${details.statusKind}`);
   return new PurchaseError(`${message} [${facts.join('; ')}]`, code, details);
 }
 
 function parseResponse(response: AppleResponse): PurchaseDictionary {
-  if (response.status !== 200) {
-    throw purchaseFailure(i18n.t('errors.purchase.httpFailure', { status: response.status }), {
-      ...responseDetails(response),
-      reason: response.status >= 300 && response.status < 400 ? 'redirect' : 'http_error',
-    });
-  }
+  let dict: PurchaseDictionary | undefined;
   try {
     const parsed: unknown = parsePlist(response.body);
-    if (dictionary(parsed)) return parsed;
+    if (dictionary(parsed)) dict = parsed;
   } catch {
     /* Do not include the raw response or parser error in diagnostics. */
   }
+  if (response.status !== 200) {
+    throw purchaseFailure(i18n.t('errors.purchase.httpFailure', { status: response.status }), {
+      ...responseDetails(response, dict),
+      reason: response.status >= 300 && response.status < 400 ? 'redirect' : 'http_error',
+      purchaseBranch: 'http_error',
+    });
+  }
+  if (dict) return dict;
   throw purchaseFailure(i18n.t('errors.purchase.invalidResponse', { status: response.status }), {
     ...responseDetails(response),
     reason: response.body.trim() ? 'invalid_plist' : 'empty_response',
+    purchaseBranch: 'invalid_plist',
   });
 }
 
@@ -127,45 +192,67 @@ function interpretResponse(
   const customerMessage = text(dict.customerMessage);
   const dialog = dictionary(dict.dialog) ? dict.dialog : {};
   const message = text(dialog.explanation) || text(dialog.message) || customerMessage;
-  const fail = (label: string, reason: DiagnosticDetails['reason'], errorCode = code || undefined): never => {
-    throw purchaseFailure(label, { ...details, reason }, errorCode);
+  const fail = (
+    label: string,
+    reason: DiagnosticDetails['reason'],
+    purchaseBranch: DiagnosticDetails['purchaseBranch'],
+    errorCode = code || undefined,
+  ): never => {
+    throw purchaseFailure(label, { ...details, reason, purchaseBranch }, errorCode);
   };
 
   if (
-    (dict.failureType !== undefined &&
-      typeof dict.failureType !== 'string' &&
-      !(typeof dict.failureType === 'number' && Number.isSafeInteger(dict.failureType))) ||
-    (dict.customerMessage !== undefined && typeof dict.customerMessage !== 'string')
+    dict.failureType !== undefined &&
+    typeof dict.failureType !== 'string' &&
+    !(typeof dict.failureType === 'number' && Number.isSafeInteger(dict.failureType))
   ) {
-    fail(i18n.t('errors.purchase.invalidResponse', { status: response.status }), 'unexpected_response');
+    fail(
+      i18n.t('errors.purchase.invalidResponse', { status: response.status }),
+      'unexpected_response',
+      'invalid_failure_type',
+    );
+  }
+  if (dict.customerMessage !== undefined && typeof dict.customerMessage !== 'string') {
+    fail(
+      i18n.t('errors.purchase.invalidResponse', { status: response.status }),
+      'unexpected_response',
+      'invalid_customer_message',
+    );
   }
 
   // Apple can request terms or show a dialog without a failureType. These are
   // transitions requiring user action, never proof that a license was granted.
-  if (requiresTerms(dict)) fail(i18n.t('errors.purchase.termsRequiredOnDevice'), 'terms_required');
-  if (code === '1008') fail(i18n.t('errors.purchase.deviceVerificationFailed'), 'device_verification');
+  if (requiresTerms(dict)) fail(i18n.t('errors.purchase.termsRequiredOnDevice'), 'terms_required', 'terms_required');
+  if (code === '1008')
+    fail(i18n.t('errors.purchase.deviceVerificationFailed'), 'device_verification', 'device_verification');
   if (
     ['2034', '2042'].includes(code) ||
     customerMessage === 'Your password has changed.' ||
     details.dialog === 'MZCommerce.ExpiredPasswordToken'
   ) {
-    fail(i18n.t('errors.purchase.passwordExpired'), 'token_expired', code || '2034');
+    fail(i18n.t('errors.purchase.passwordExpired'), 'token_expired', 'token_expired', code || '2034');
   }
   if (customerMessage === 'Subscription Required')
-    fail(i18n.t('errors.purchase.subscriptionRequired'), 'subscription_required');
+    fail(i18n.t('errors.purchase.subscriptionRequired'), 'subscription_required', 'subscription_required');
 
   // A contradictory dialog/action/status cannot be reclassified as success or
   // an automatic retry, even if it is accompanied by a familiar numeric code.
-  if (dict.dialog !== undefined || dict.action !== undefined || (dict.status !== undefined && dict.status !== 0)) {
-    fail(message || i18n.t('errors.purchase.failedGeneral'), 'unexpected_response');
+  if (dict.dialog !== undefined) {
+    fail(message || i18n.t('errors.purchase.failedGeneral'), 'unexpected_response', 'dialog_present');
   }
-  if (code === '2059') fail(i18n.t('errors.purchase.unavailable'), 'unavailable');
+  if (dict.action !== undefined) {
+    fail(message || i18n.t('errors.purchase.failedGeneral'), 'unexpected_response', 'action_present');
+  }
+  if (dict.status !== undefined && dict.status !== 0) {
+    fail(message || i18n.t('errors.purchase.failedGeneral'), 'unexpected_response', 'invalid_status');
+  }
+  if (code === '2059') fail(i18n.t('errors.purchase.unavailable'), 'unavailable', 'unavailable');
   if (code === '5002') {
     if (
       customerMessage &&
       !['An unknown error has occurred', 'An unknown error has occurred.'].includes(customerMessage)
     ) {
-      fail(customerMessage, 'unexpected_response');
+      fail(customerMessage, 'unexpected_response', 'conflicting_message');
     }
     return { updatedCookies: cookies, alreadyOwned: true };
   }
@@ -177,10 +264,14 @@ function interpretResponse(
         ? i18n.t('errors.purchase.unknownError')
         : customerMessage || i18n.t('errors.purchase.failed', { failureType: code }),
       'unexpected_response',
+      code ? 'failure_code' : 'customer_message',
     );
   }
-  if (dict.jingleDocType !== 'purchaseSuccess' || dict.status !== 0) {
-    fail(i18n.t('errors.purchase.failedGeneral'), 'unexpected_response');
+  if (dict.jingleDocType !== 'purchaseSuccess') {
+    fail(i18n.t('errors.purchase.failedGeneral'), 'unexpected_response', 'missing_success_document');
+  }
+  if (dict.status !== 0) {
+    fail(i18n.t('errors.purchase.failedGeneral'), 'unexpected_response', 'missing_success_status');
   }
   return { updatedCookies: cookies, alreadyOwned: false };
 }
@@ -239,6 +330,7 @@ export async function purchaseApp(
           ...responseDetails(response, dict),
           attempt,
           alreadyOwned: result.alreadyOwned,
+          purchaseBranch: result.alreadyOwned ? 'already_owned' : 'success',
           durationMs: Date.now() - started,
         });
         return result;

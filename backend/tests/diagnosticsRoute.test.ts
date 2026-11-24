@@ -49,6 +49,32 @@ describe('browser diagnostic boundary', () => {
     expect(log.mock.calls.flat().join(' ')).not.toContain('private');
   });
 
+  it('logs all new purchase classifications without changing the schema or legacy dialog value', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const input = {
+      ...event,
+      dialog: 'other',
+      dialogCode: 'MZCommerceInAppBuy.Authorization.Required12',
+      purchaseBranch: 'dialog_present',
+      failureTypeKind: 'numeric',
+      statusKind: 'missing',
+      dialogPresent: true,
+      actionPresent: false,
+      messagePresent: true,
+      dialogKind: 'authorization',
+      actionKind: 'missing',
+    };
+    const response = await request(app())
+      .post('/api/diagnostics')
+      .set('X-Access-Token', 'fixture-access')
+      .set('Cookie', 'private-cookie')
+      .send(input);
+    expect(response.status).toBe(204);
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(log.mock.calls[0][0])).toEqual({ event: 'asspp.diagnostic', source: 'browser', ...input });
+    expect(log.mock.calls.flat().join(' ')).not.toContain('private');
+  });
+
   it.each([
     'password',
     'email',
@@ -60,6 +86,9 @@ describe('browser diagnostic boundary', () => {
     'message',
     'stack',
     'url',
+    'customerMessage',
+    'metrics',
+    'dialogId',
     'event',
     'source',
   ])('rejects unlisted %s without logging any request content', async (field) => {
@@ -87,10 +116,28 @@ describe('browser diagnostic boundary', () => {
     { ...event, durationMs: { state: 'secret' } },
     { ...event, responseType: 'unrecognized-private-response' },
     { ...event, dialog: 'private-dialog-message' },
+    { ...event, dialogCode: 'private@example.com' },
+    { ...event, dialogCode: 'MZCommerce.SystemError\n' },
+    { ...event, dialogCode: 'MZCommerce.SystemError\r\n' },
+    { ...event, dialogCode: 'MZCommerce.SystemError\u2028' },
+    { ...event, dialogCode: 'MZCommerce.SystemError?token=private' },
+    { ...event, dialogCode: 'MZCommerce.SystemError/private' },
+    { ...event, dialogCode: `MZCommerce.${'A'.repeat(49)}` },
+    { ...event, dialogCode: ['MZCommerce.SystemError'] },
+    { ...event, dialogCode: 'PROOF_FAILED' },
+    { ...event, purchaseBranch: 'private-message' },
+    { ...event, failureTypeKind: 'private-token' },
+    { ...event, statusKind: 0 },
+    { ...event, dialogKind: { message: 'private-message' } },
+    { ...event, actionKind: 'https://apple.com/?token=private' },
+    { ...event, dialogPresent: 'true' },
+    { ...event, actionPresent: 1 },
+    { ...event, messagePresent: ['private-message'] },
   ])('rejects invalid values, nested objects, and arrays', async (input) => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const response = await request(app()).post('/api/diagnostics').set('X-Access-Token', 'fixture-access').send(input);
     expect(response.status).toBe(400);
+    expect(response.text).not.toContain('private');
     expect(log).not.toHaveBeenCalled();
   });
 
@@ -161,6 +208,11 @@ describe('browser diagnostic boundary', () => {
       'diagnosticReasons',
       'diagnosticEndpoints',
       'diagnosticErrorCodes',
+      'diagnosticPurchaseBranches',
+      'diagnosticFailureTypeKinds',
+      'diagnosticStatusKinds',
+      'diagnosticDialogKinds',
+      'diagnosticActionKinds',
     ]) {
       const values = (source: string) => {
         const match = source.match(new RegExp(`export const ${name} = \\[([\\s\\S]*?)\\] as const;`));
