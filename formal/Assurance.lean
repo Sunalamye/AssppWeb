@@ -1,0 +1,37 @@
+import Asspp
+
+#print axioms Asspp.stale_worker_cannot_change
+#print axioms Asspp.deleted_is_absorbing
+#print axioms Asspp.deleted_stays_deleted_for_any_trace
+#print axioms Asspp.completed_rejects_worker
+#print axioms Asspp.paused_rejects_worker
+#print axioms Asspp.delete_always_tombstones
+#print axioms Asspp.completion_has_live_predecessor
+#print axioms Asspp.successful_download_trace_completes
+#print axioms Asspp.pause_resume_trace_completes
+#print axioms Asspp.accepted_chunk_is_exact
+#print axioms Asspp.accepted_chunk_bounds
+#print axioms Asspp.ignored_range_is_rejected
+#print axioms Asspp.truncated_chunk_is_rejected
+#print axioms Asspp.exact_safe_chunk_is_accepted
+#print axioms Asspp.exact_middle_chunk_is_accepted
+#print axioms Asspp.download_dialog_denies
+#print axioms Asspp.download_invalid_shape_denies
+#print axioms Asspp.download_message_denies
+#print axioms Asspp.download_action_denies
+#print axioms Asspp.download_status_denies
+#print axioms Asspp.download_error_denies
+#print axioms Asspp.download_items_require_clean_success
+#print axioms Asspp.clean_download_items_are_accepted
+#print axioms Asspp.unavailable_license_with_generic_message_falls_back
+#print axioms Asspp.auth_action_denies
+#print axioms Asspp.auth_invalid_shape_denies
+#print axioms Asspp.auth_dialog_denies
+#print axioms Asspp.auth_rejected_status_denies
+#print axioms Asspp.authentication_requires_credentials
+#print axioms Asspp.credential_retry_is_bounded
+#print axioms Asspp.clean_authentication_succeeds
+#print axioms Asspp.provisioning_requires_live_matching_handle
+#print axioms Asspp.provisioning_cannot_replay
+#print axioms Asspp.wrong_device_preserves_handle
+#print axioms Asspp.live_provisioning_consumes

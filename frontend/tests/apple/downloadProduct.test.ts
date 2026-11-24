@@ -59,6 +59,14 @@ describe('download recovery boundaries', () => {
     [{ action: { url: 'https://buy.itunes.apple.com/termsPage' } }, false],
     [{ dialog: { explanation: 'Review your account' } }, false],
     [{ customerMessage: 'Accept new terms' }, false],
+    [{ failureType: '5002', status: 1 }, false],
+    [{ failureType: '5002', customerMessage: 'Your password has changed.' }, false],
+    [{ failureType: '5002', customerMessage: 'Account is disabled' }, false],
+    [{ failureType: '5002', dialog: false }, false],
+    [{ failureType: '5002', action: '' }, false],
+    [{ status: '0' }, false],
+    [{ failureType: false }, false],
+    [{ songList: false }, false],
     [{ songList: [{}] }, false],
   ])('does not turn auth/license failures into endpoint retries: %j', (dict, expected) => {
     expect(needsDownloadFallback(dict)).toBe(expected);

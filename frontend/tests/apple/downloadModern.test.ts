@@ -249,8 +249,32 @@ describe('native entitlement downloads', () => {
   });
 
   it.each([
+    { failureType: '5002', status: 1 },
+    { failureType: '5002', customerMessage: 'Your password has changed.' },
+    { failureType: '5002', customerMessage: 'Account is disabled' },
+    { failureType: '5002', metrics: { messageCode: '2034' } },
+    { failureType: '5002', metrics: { messageCode: '9610' } },
+    { failureType: '5002', action: false },
+    { failureType: '5002', dialog: '' },
+    { failureType: false },
+    { customerMessage: false },
+    { songList: false },
+  ])('does not recover a contradictory or malformed entitlement response: %j', async (dict) => {
+    vi.mocked(appleRequest).mockResolvedValueOnce(response(dict)).mockResolvedValue(success());
+    await expect(downloadProduct(account, app, '987654321')).rejects.toThrow();
+    expect(appleRequest).toHaveBeenCalledOnce();
+  });
+
+  it.each([
     { status: 1 },
     { status: 'failed' },
+    { status: '0' },
+    { status: false },
+    { metrics: { messageCode: '1008' } },
+    { failureType: false },
+    { customerMessage: false },
+    { dialog: false },
+    { action: '' },
     { dialog: { message: 'Account needs review' } },
     { action: { kind: 'Goto', url: 'https://example.invalid/private-action' } },
   ])('does not treat metadata accompanied by an explicit rejection as success: %j', async (failure) => {

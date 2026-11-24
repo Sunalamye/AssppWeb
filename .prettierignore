@@ -8,3 +8,6 @@ CLAUDE.md
 
 # Generated fixed SAP algorithm tables.
 frontend/src/apple/sap/tables.json
+
+# Lean and Go use their own language formatting; generated proof artifacts are transient.
+formal/.lake/

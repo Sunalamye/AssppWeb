@@ -155,6 +155,8 @@ router.post('/store-proof', async (req, res) => {
   } finally {
     clearTimeout(timeout);
     res.off('close', onClose);
+    // A rejected Content-Length can leave the body unread; release its socket.
+    controller.abort();
     activeRequests--;
   }
 });

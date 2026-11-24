@@ -5,11 +5,14 @@ import { extractAndMergeCookies } from './cookies';
 import { buildPlist, parsePlist } from './plist';
 import { appleRequest } from './request';
 import { StoreProofClient } from './storeProof';
+import { hasResponseField, isResponseDictionary, responseFailureCode, validFailureType } from './responseShape';
+import { decideDownloadResponse } from '../domain/downloadPolicy';
 import { createDiagnosticFlow, errorDiagnosticDetails, attachDiagnosticId } from '../utils/diagnostics';
 import { redownloadEndpoint, volumeStoreEndpoint } from './config';
 import type { DiagnosticFlow, DiagnosticDetails } from '../utils/diagnostics';
 import type { StoreDownloadEndpoint } from './config';
 import type { AppleResponse } from './request';
+import type { DownloadResponseFacts } from '../domain/downloadPolicy';
 import type { Account, Software } from '../types';
 
 export class DownloadError extends Error {
@@ -26,13 +29,31 @@ export class DownloadError extends Error {
 // Only the observed empty/unavailable responses permit endpoint recovery.
 // Authentication, license, and other structured failures must not be hidden.
 export function needsDownloadFallback(dict: Record<string, any>): boolean {
-  if (dict.songList?.length || dict.dialog || dict.action) return false;
-  if (dict.failureType) return String(dict.failureType) === '5002';
-  if (dict.status !== undefined && Number(dict.status) !== 0) return false;
-  const message = String(dict.customerMessage ?? '')
-    .trim()
-    .toLowerCase();
-  return !message || message === 'no longer available' || message.endsWith(' no longer available');
+  return decideDownloadResponse(downloadResponseFacts(dict)) === 'fallback';
+}
+
+/** Keep untyped Apple data outside the finite policy; never coerce a denial to zero/absence. */
+export function downloadResponseFacts(dict: Record<string, any>): DownloadResponseFacts {
+  const code = responseFailureCode(dict.failureType);
+  const message = typeof dict.customerMessage === 'string' ? dict.customerMessage.trim().toLowerCase() : '';
+  return {
+    validShape:
+      validFailureType(dict.failureType) &&
+      (dict.customerMessage === undefined || typeof dict.customerMessage === 'string') &&
+      (dict.songList === undefined || Array.isArray(dict.songList)),
+    dialogPresent: hasResponseField(dict, 'dialog'),
+    actionPresent: hasResponseField(dict, 'action'),
+    status: dict.status === undefined ? 'missing' : dict.status === 0 ? 'zero' : 'rejected',
+    itemsPresent: Array.isArray(dict.songList) && dict.songList.length > 0,
+    failure: !code ? 'none' : code === '5002' ? 'unavailable' : 'other',
+    message: !message
+      ? 'none'
+      : message === 'no longer available' || message.endsWith(' no longer available')
+        ? 'unavailable'
+        : ['an unknown error has occurred', 'an unknown error has occurred.'].includes(message)
+          ? 'generic'
+          : 'other',
+  };
 }
 
 export function dispatchEndpoint(
@@ -62,7 +83,7 @@ function responseDict(response: AppleResponse, endpoint: StoreDownloadEndpoint):
   if (response.status === 200) {
     try {
       const dict = parsePlist(response.body);
-      if (dict && typeof dict === 'object' && !Array.isArray(dict)) return normalizeDownloadFailure(dict);
+      if (isResponseDictionary(dict)) return normalizeDownloadFailure(dict);
     } catch {
       // Report the same safe diagnostic for every malformed response.
     }
@@ -76,14 +97,20 @@ function responseDict(response: AppleResponse, endpoint: StoreDownloadEndpoint):
 }
 
 function normalizeDownloadFailure(dict: Record<string, any>): Record<string, any> {
-  const failureType = String(dict.failureType || (!dict.songList?.length && dict.metrics?.messageCode) || '').trim();
+  // Preserve malformed markers so the policy rejects them instead of erasing them.
+  if (!validFailureType(dict.failureType)) return dict;
+  const metricCode = isResponseDictionary(dict.metrics) ? responseFailureCode(dict.metrics.messageCode) : '';
+  // A recognized account/license denial remains terminal even when another
+  // field says the endpoint cannot serve this app or contains package metadata.
+  const failureType = ['2034', '2042', '1008', '9610'].includes(metricCode)
+    ? metricCode
+    : responseFailureCode(dict.failureType) || (!dict.songList?.length ? metricCode : '');
   if (['2034', '2042', '1008'].includes(failureType)) return { ...dict, failureType: '2034' };
-  if (dict.songList?.length) return failureType ? { ...dict, failureType } : dict;
-  const message = String(dict.customerMessage ?? '')
+  const message = (typeof dict.customerMessage === 'string' ? dict.customerMessage : '')
     .trim()
     .replace(/\s+/g, ' ')
     .toLowerCase();
-  if (['sign in to the itunes store', 'sign-in required'].includes(message)) {
+  if (['sign in to the itunes store', 'sign-in required', 'your password has changed.'].includes(message)) {
     return { ...dict, failureType: '2034' };
   }
   const dialogMessage = String(dict.dialog?.message ?? '')
@@ -106,7 +133,12 @@ function normalizeDownloadFailure(dict: Record<string, any>): Record<string, any
 }
 
 function requireItems(dict: Record<string, any>): void {
-  const code = String(dict.failureType ?? '');
+  const facts = downloadResponseFacts(dict);
+  if (decideDownloadResponse(facts) === 'items') return;
+  if (!facts.validShape) {
+    throw new DownloadError('Apple returned invalid download data', undefined, { reason: 'invalid_response' });
+  }
+  const code = responseFailureCode(dict.failureType);
   if (code) {
     if (['2034', '2042'].includes(code) || dict.customerMessage === 'Your password has changed.') {
       throw new DownloadError(i18n.t('errors.download.passwordExpired'), code);
@@ -115,7 +147,7 @@ function requireItems(dict: Record<string, any>): void {
     throw new DownloadError(`${dict.customerMessage || 'Apple download failed'} (${code})`, code);
   }
   if (dict.customerMessage) throw new DownloadError(String(dict.customerMessage));
-  if (dict.dialog || dict.action || (dict.status !== undefined && Number(dict.status) !== 0)) {
+  if (facts.dialogPresent || facts.actionPresent || facts.status === 'rejected') {
     const message = dict.dialog?.explanation ?? dict.dialog?.message;
     throw new DownloadError(
       typeof message === 'string' && message ? message : 'Apple rejected the download request',
@@ -123,9 +155,7 @@ function requireItems(dict: Record<string, any>): void {
       { reason: 'access_denied' },
     );
   }
-  if (!Array.isArray(dict.songList) || !dict.songList.length) {
-    throw new DownloadError(dict.customerMessage || i18n.t('errors.download.noItems'));
-  }
+  throw new DownloadError(dict.customerMessage || i18n.t('errors.download.noItems'));
 }
 
 function validateDownloadItem(dict: Record<string, any>, app: Software, version?: string): void {

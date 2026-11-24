@@ -5,6 +5,7 @@ import { config } from '../config.js';
 import { getAllTasks } from '../services/downloadManager.js';
 import { buildManifest, getWhitePng } from '../services/manifestBuilder.js';
 import { getIdParam } from '../utils/route.js';
+import { streamPackageFile } from '../utils/packageFile.js';
 
 const router = Router();
 
@@ -54,7 +55,7 @@ router.get('/install/:id/manifest.plist', (req: Request, res: Response) => {
   const id = getIdParam(req);
   const task = getAllTasks().find((t) => t.id === id && t.status === 'completed');
 
-  if (!task || !task.filePath) {
+  if (!task || !task.filePath || !fs.existsSync(task.filePath)) {
     res.status(404).json({ error: 'Package not found' });
     return;
   }
@@ -74,7 +75,7 @@ router.get('/install/:id/url', (req: Request, res: Response) => {
   const id = getIdParam(req);
   const task = getAllTasks().find((t) => t.id === id && t.status === 'completed');
 
-  if (!task || !task.filePath) {
+  if (!task || !task.filePath || !fs.existsSync(task.filePath)) {
     res.status(404).json({ error: 'Package not found' });
     return;
   }
@@ -104,12 +105,7 @@ router.get('/install/:id/payload.ipa', (req: Request, res: Response) => {
     return;
   }
 
-  res.setHeader('Content-Type', 'application/octet-stream');
-  const stats = fs.statSync(resolvedPath);
-  res.setHeader('Content-Length', stats.size);
-
-  const stream = fs.createReadStream(resolvedPath);
-  stream.pipe(res);
+  streamPackageFile(req, res, resolvedPath, task.id);
 });
 
 // Small icon placeholder (57x57)

@@ -5,6 +5,8 @@ import { config, DOWNLOAD_TIMEOUT_MS } from '../config.js';
 import { inject } from './sinfInjector.js';
 import { ChunkedDownloader } from './chunkedDownloader.js';
 import { createServerDiagnostic } from '../utils/diagnostics.js';
+import { transitionDownload } from '../domain/downloadPolicy.js';
+import type { DownloadEvent } from '../domain/downloadPolicy.js';
 import type { DiagnosticEvent, DiagnosticDetails, ServerDiagnostic } from '../utils/diagnostics.js';
 import type { DownloadTask, Software, Sinf } from '../types/index.js';
 
@@ -25,14 +27,23 @@ function taskTrace(task: DownloadTask): ServerDiagnostic {
   return trace;
 }
 
-function setTaskState(task: DownloadTask, state: DownloadTask['status'], reason?: DiagnosticDetails['reason']) {
-  task.status = state;
+function setTaskState(
+  task: DownloadTask,
+  event: DownloadEvent,
+  reason?: DiagnosticDetails['reason'],
+  currentGeneration = true,
+): boolean {
+  const state = transitionDownload(task.status, event, currentGeneration);
+  if (state === task.status) return false;
+  if (state === 'deleted') tasks.delete(task.id);
+  else task.status = state;
   taskTrace(task).event(
     'task_state',
     state === 'completed' ? 'success' : state === 'failed' ? 'failure' : 'transition',
     reason ? { reason } : {},
     { taskId: task.id, taskState: state },
   );
+  return true;
 }
 
 const PACKAGES_DIR = path.join(config.dataDir, 'packages');
@@ -92,22 +103,34 @@ export function sanitizeTaskForResponse(
 }
 
 // --- Persistence: save only completed task metadata (no secrets) ---
-function persistTasks() {
+function persistTasks(completing?: DownloadTask) {
   const completed = Array.from(tasks.values())
-    .filter((t) => t.status === 'completed' && t.filePath)
+    .filter((t) => (t.status === 'completed' || t === completing) && t.filePath)
     .map((t) => ({
       id: t.id,
       software: t.software,
       accountHash: t.accountHash,
       downloadURL: '',
       sinfs: [],
-      status: t.status,
-      progress: t.progress,
-      speed: t.speed,
+      status: 'completed',
+      progress: 100,
+      speed: '0 B/s',
       filePath: t.filePath,
       createdAt: t.createdAt,
     }));
-  fs.writeFileSync(TASKS_FILE, JSON.stringify(completed, null, 2));
+  // Publish a complete replacement on the same filesystem. A failed write or
+  // rename must leave the previous index usable on the next process start.
+  const temporary = `${TASKS_FILE}.${uuidv4()}.tmp`;
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(completed, null, 2), { mode: 0o600, flush: true });
+    fs.renameSync(temporary, TASKS_FILE);
+  } finally {
+    try {
+      fs.unlinkSync(temporary);
+    } catch {
+      /* Renamed successfully or cleanup is unavailable. */
+    }
+  }
 }
 
 function deleteCleanupTask(id: string): boolean {
@@ -119,7 +142,9 @@ function deleteCleanupTask(id: string): boolean {
   } catch {
     // One inaccessible package must not stop cleanup or an unrelated download.
     trace.event('package_save', 'failure', { reason: 'storage' }, { taskId: id });
-    return false;
+    // Deleting the file may have succeeded before the index publication failed.
+    // Count those freed bytes so a metadata error does not evict extra packages.
+    return !tasks.has(id);
   }
 }
 
@@ -207,44 +232,66 @@ function initOnStartup() {
   // Ensure packages dir exists
   fs.mkdirSync(PACKAGES_DIR, { recursive: true });
 
-  // Load completed tasks from previous run
+  // Missing or corrupt metadata is not evidence that existing final packages
+  // are disposable; restore a task only from a fully readable index.
   if (fs.existsSync(TASKS_FILE)) {
     try {
       const data = JSON.parse(fs.readFileSync(TASKS_FILE, 'utf-8'));
-      if (Array.isArray(data)) {
-        for (const item of data) {
-          // Only restore completed tasks whose IPA file still exists
-          if (item.id && item.status === 'completed' && item.filePath && fs.existsSync(item.filePath)) {
-            const task: DownloadTask = {
-              id: item.id,
-              software: item.software,
-              accountHash: item.accountHash,
-              downloadURL: '',
-              sinfs: [],
-              status: 'completed',
-              progress: 100,
-              speed: '0 B/s',
-              filePath: item.filePath,
-              createdAt: item.createdAt,
-            };
-            tasks.set(task.id, task);
-          }
+      if (!Array.isArray(data)) throw new Error('Invalid task index');
+      const packagesBase = path.resolve(PACKAGES_DIR) + path.sep;
+      if (
+        !data.every(
+          (item) =>
+            item &&
+            typeof item.id === 'string' &&
+            item.id.length > 0 &&
+            item.status === 'completed' &&
+            typeof item.accountHash === 'string' &&
+            typeof item.createdAt === 'string' &&
+            typeof item.filePath === 'string' &&
+            path.resolve(item.filePath).startsWith(packagesBase) &&
+            item.software &&
+            typeof item.software.name === 'string' &&
+            typeof item.software.bundleID === 'string' &&
+            typeof item.software.version === 'string',
+        )
+      ) {
+        throw new Error('Invalid task index');
+      }
+      for (const item of data) {
+        // Only restore completed tasks whose IPA file still exists
+        if (item.id && item.status === 'completed' && item.filePath && fs.existsSync(item.filePath)) {
+          const task: DownloadTask = {
+            id: item.id,
+            software: item.software,
+            accountHash: item.accountHash,
+            downloadURL: '',
+            sinfs: [],
+            status: 'completed',
+            progress: 100,
+            speed: '0 B/s',
+            filePath: item.filePath,
+            createdAt: item.createdAt,
+          };
+          tasks.set(task.id, task);
         }
       }
     } catch {
-      // Corrupted file — start fresh
+      createServerDiagnostic('download').event('package_save', 'failure', { reason: 'storage' });
     }
   }
 
-  // Clean up orphaned IPA files (files without a task)
-  cleanOrphanedPackages();
+  // Clean up recognized transient parts only. An unindexed final IPA may be a
+  // completed package whose metadata was lost; keep it for manual recovery,
+  // including after a subsequent successful index write and process restart.
+  cleanTransientParts();
 
   // Run time-based cleanup once on startup, then schedule daily
   runTimeCleanup();
   scheduleDailyCleanup();
 }
 
-function cleanOrphanedPackages() {
+function cleanTransientParts() {
   const knownPaths = new Set<string>();
   for (const task of tasks.values()) {
     if (task.filePath) {
@@ -265,8 +312,8 @@ function cleanOrphanedPackages() {
         if (fs.readdirSync(fullPath).length === 0) {
           fs.rmdirSync(fullPath);
         }
-      } else if (entry.isFile() && !knownPaths.has(path.resolve(fullPath))) {
-        // Orphaned file or leftover .part temp file — remove
+      } else if (entry.isFile() && /\.ipa\.part[0-9]+$/.test(entry.name) && !knownPaths.has(path.resolve(fullPath))) {
+        // Only known downloader scratch files are disposable without metadata.
         fs.unlinkSync(fullPath);
       }
     }
@@ -364,7 +411,7 @@ export function deleteTask(id: string): boolean {
     // than a downloading/injecting task with no worker after a filesystem error.
     task.error = 'Failed to delete download';
     task.speed = '0 B/s';
-    setTaskState(task, 'failed', 'storage');
+    setTaskState(task, 'deleteFailed', 'storage');
     trace.event('task_cancel', 'failure', { reason: 'storage' }, { taskId: task.id, taskState: 'failed' });
     try {
       // Remove previously completed metadata when storage is still writable.
@@ -376,17 +423,23 @@ export function deleteTask(id: string): boolean {
     throw new Error('Failed to delete download');
   }
 
-  tasks.delete(id);
+  setTaskState(task, 'delete', 'cancelled');
   progressListeners.delete(id);
   taskDiagnostics.delete(id);
-  persistTasks();
+  try {
+    persistTasks();
+  } catch {
+    trace.event('package_save', 'failure', { reason: 'storage' }, { taskId: id, taskState: 'deleted' });
+    trace.event('task_cancel', 'failure', { reason: 'storage' }, { taskId: id, taskState: 'deleted' });
+    throw new Error('Failed to save download deletion');
+  }
   trace.event('task_cancel', 'cancelled', { reason: 'cancelled' }, { taskId: task.id, taskState: 'deleted' });
   return true;
 }
 
 export function pauseTask(id: string): boolean {
   const task = tasks.get(id);
-  if (!task || task.status !== 'downloading') return false;
+  if (!task || transitionDownload(task.status, 'pause', true) === task.status) return false;
   // Invalidate before abort: an old rejection must never mutate a resumed run.
   activeRuns.delete(id);
 
@@ -401,7 +454,8 @@ export function pauseTask(id: string): boolean {
     chunkDownloaders.delete(id);
   }
 
-  setTaskState(task, 'paused', 'cancelled');
+  setTaskState(task, 'pause', 'cancelled');
+  task.speed = '0 B/s';
   taskTrace(task).event('task_pause', 'success', {}, { taskId: task.id, taskState: 'paused' });
   notifyProgress(task);
   return true;
@@ -409,7 +463,7 @@ export function pauseTask(id: string): boolean {
 
 export function resumeTask(id: string): boolean {
   const task = tasks.get(id);
-  if (!task || task.status !== 'paused') return false;
+  if (!task || transitionDownload(task.status, 'resume', true) === task.status) return false;
   taskTrace(task).event('task_resume', 'start', {}, { taskId: task.id });
   startDownload(task);
   return true;
@@ -457,7 +511,7 @@ function startDownload(task: DownloadTask) {
   activeRuns.set(task.id, run);
   // Resume becomes pending immediately, so a second resume cannot enqueue a
   // second job while the aborted predecessor is still releasing file handles.
-  if (task.status !== 'pending') setTaskState(task, 'pending');
+  if (task.status !== 'pending') setTaskState(task, 'resume');
   notifyProgress(task);
   const job = (async () => {
     if (previous) await previous;
@@ -487,7 +541,7 @@ async function runDownload(task: DownloadTask, run: symbol) {
     runTimeCleanup();
     runSpaceCleanup();
     if (!current()) return;
-    setTaskState(task, 'downloading');
+    if (!setTaskState(task, 'start', undefined, current())) return;
     task.progress = 0;
     task.speed = '0 B/s';
     task.error = undefined;
@@ -525,9 +579,9 @@ async function runDownload(task: DownloadTask, run: symbol) {
     }
     trace.event(stage, 'success', {}, { taskId: task.id });
 
-    if (task.sinfs.length > 0) {
+    if (task.sinfs.length > 0 || task.iTunesMetadata) {
       stage = 'ipa_compile';
-      setTaskState(task, 'injecting');
+      if (!setTaskState(task, 'compile', undefined, current())) return;
       task.progress = 100;
       notifyProgress(task);
       trace.event(stage, 'start', {}, { taskId: task.id });
@@ -542,15 +596,16 @@ async function runDownload(task: DownloadTask, run: symbol) {
 
     stage = 'package_save';
     trace.event(stage, 'start', {}, { taskId: task.id });
-    task.status = 'completed';
+    // Persist the proposed completed record before reporting completion or
+    // discarding the inputs needed to describe this still-active run.
+    persistTasks(task);
+    setTaskState(task, 'complete', undefined, current());
     task.progress = 100;
     task.speed = '0 B/s';
     task.downloadURL = '';
     task.sinfs = [];
     task.iTunesMetadata = undefined;
-    persistTasks();
     trace.event(stage, 'success', {}, { taskId: task.id });
-    setTaskState(task, 'completed');
     notifyProgress(task);
   } catch {
     if (!current()) {
@@ -559,7 +614,7 @@ async function runDownload(task: DownloadTask, run: symbol) {
     }
     const reason = timedOut ? 'timeout' : stage === 'package_save' ? 'storage' : 'network';
     trace.event(stage, 'failure', { reason }, { taskId: task.id });
-    setTaskState(task, 'failed', reason);
+    setTaskState(task, 'fail', reason, current());
     task.error = timedOut ? 'Download timed out' : 'Download failed';
     task.speed = '0 B/s';
     notifyProgress(task);

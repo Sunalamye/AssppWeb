@@ -143,6 +143,12 @@ Cross-tab account coordination requires Web Locks; browsers without that API ret
 
 ## Verification commands
 
+The required source gate is now `npm run verify`, including the pinned Lean
+model and TypeScript/Go correspondence. See [formal-verification.md](formal-verification.md)
+for the exact proof coverage and new counterexamples. Docker copies the gate's
+fresh success receipt into the runtime image, so a failed gate blocks that
+image build. This does not replace the rollout checks below.
+
 Workers Builds success means that the Worker deployment and container rollout were submitted. Before calling a release complete, compare the live container image with the image built for that commit, send a safe diagnostic event, and query its `flowId` in the Containers dataset. Include `/api/store-proof/health` in the same flow to verify the browser, backend, and helper correlation headers. A Worker version at 100% traffic alone does not prove the container already runs the new image. See [Cloudflare's rollout lifecycle](https://developers.cloudflare.com/containers/configuration/rollouts/).
 
 ```bash
@@ -152,6 +158,8 @@ npm --prefix frontend run build
 npm --prefix backend test
 npm --prefix backend run build
 npm run format:check
+npm run test:helper
+npm run verify:formal
 ```
 
 Run the Go helper tests inside the pinned upstream module as described in `proof-helper/README.md`. Native/helper synthetic tests do not establish that a real Apple account completed sign-in or received a license; that final acceptance must come from the user's browser and its correlated diagnostics.

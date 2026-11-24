@@ -182,11 +182,28 @@ function validateEndpoint(endpoint: string): void {
   throw new StoreProofError('Store proof endpoint is not allowed');
 }
 
-async function timedFetch(path: string, options: RequestInit, timeoutMs: number): Promise<Response> {
+async function timedFetch(
+  path: string,
+  options: RequestInit,
+  timeoutMs: number,
+): Promise<{ response: Response; result: any }> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await fetch(path, { ...options, signal: controller.signal });
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new DOMException('Device verification response timed out', 'TimeoutError'));
+      }, timeoutMs);
+    });
+    // A response is complete only when its body has been read. Headers alone
+    // must not release the deadline and leave the per-device queue locked.
+    const completed = (async () => {
+      const response = await fetch(path, { ...options, signal: controller.signal });
+      const result = await response.json().catch(() => ({}));
+      return { response, result };
+    })();
+    return await Promise.race([completed, deadline]);
   } catch {
     throw new StoreProofError(
       'Device verification could not reach the server. Try again shortly.',
@@ -194,7 +211,7 @@ async function timedFetch(path: string, options: RequestInit, timeoutMs: number)
       { reason: controller.signal.aborted ? 'timeout' : 'network' },
     );
   } finally {
-    clearTimeout(timer);
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
@@ -203,9 +220,9 @@ async function request(
   flow: DiagnosticFlow,
   stage: DiagnosticEvent['stage'],
 ): Promise<Record<string, any>> {
-  let response: Response;
+  let received: Awaited<ReturnType<typeof timedFetch>>;
   try {
-    response = await timedFetch(
+    received = await timedFetch(
       '/api/store-proof',
       {
         method: 'POST',
@@ -218,7 +235,7 @@ async function request(
     flow.log(stage, 'failure', { ...errorDiagnosticDetails(error), endpoint: 'helper' });
     throw error;
   }
-  const result = await response.json().catch(() => ({}));
+  const { response, result } = received;
   flow.log(stage, response.ok ? 'transition' : 'failure', {
     endpoint: 'helper',
     httpStatus: response.status,
@@ -250,9 +267,9 @@ async function waitForReady(flow: DiagnosticFlow, stage: DiagnosticEvent['stage'
   let attempt = 0;
   while (Date.now() < deadline) {
     attempt++;
-    let response: Response | undefined;
+    let received: Awaited<ReturnType<typeof timedFetch>> | undefined;
     try {
-      response = await timedFetch(
+      received = await timedFetch(
         '/api/store-proof/health',
         { headers: { ...authHeaders(), 'X-Asspp-Flow-Id': flow.id } },
         10_000,
@@ -260,8 +277,8 @@ async function waitForReady(flow: DiagnosticFlow, stage: DiagnosticEvent['stage'
     } catch (error) {
       if (!(error instanceof StoreProofError) || error.code !== 'HELPER_UNAVAILABLE') throw error;
     }
-    if (response) {
-      const health = await response.json().catch(() => ({}));
+    if (received) {
+      const { response, result: health } = received;
       if (response.ok && health.status === 'ready') {
         flow.log(stage, 'transition', {
           endpoint: 'helper',
@@ -278,7 +295,7 @@ async function waitForReady(flow: DiagnosticFlow, stage: DiagnosticEvent['stage'
     }
     flow.log(stage, 'retry', {
       endpoint: 'helper',
-      httpStatus: response?.status,
+      httpStatus: received?.response.status,
       reason: 'not_ready',
       attempt,
       retryDelayMs: 3000,

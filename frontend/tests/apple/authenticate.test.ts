@@ -102,4 +102,38 @@ describe('apple/authenticate', () => {
       });
     },
   );
+
+  it.each([
+    { status: 1 },
+    { status: '0' },
+    { status: false },
+    { action: { kind: 'SignIn' } },
+    { action: false },
+    { dialog: false },
+    { failureType: [] },
+    { customerMessage: false },
+    { failureType: '-5000', dialog: { message: 'Open the App Store to continue.' } },
+    { customerMessage: 'MZFinance.BadLogin.Configurator_message', action: { kind: 'Goto' } },
+  ])('rejects contradictory authentication data before success or continuation: %j', async (failure) => {
+    vi.mocked(fetchBag).mockResolvedValue({ authURL: 'https://auth.itunes.apple.com/auth/v1/native' });
+    const success = {
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      rawHeaders: [],
+      body: buildPlist({ passwordToken: 'token', dsPersonId: '123' }),
+    };
+    vi.mocked(appleRequest)
+      .mockResolvedValueOnce({
+        ...success,
+        body: buildPlist({ passwordToken: 'token', dsPersonId: '123', ...failure }),
+      })
+      .mockResolvedValue(success);
+    await expect(
+      authenticate('test@example.com', 'password', undefined, undefined, 'aabbccddeeff'),
+    ).rejects.toMatchObject({
+      codeRequired: false,
+    });
+    expect(appleRequest).toHaveBeenCalledOnce();
+  });
 });

@@ -1,0 +1,10 @@
+name = "asspp-spec"
+version = "0.1.0"
+defaultTargets = ["Asspp", "asspp_oracle"]
+
+[[lean_lib]]
+name = "Asspp"
+
+[[lean_exe]]
+name = "asspp_oracle"
+root = "Main"
