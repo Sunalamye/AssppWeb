@@ -26,7 +26,7 @@ To test your local working tree with OrbStack or Docker:
 docker compose -f compose.yml -f compose.local.yml up --build -d
 ```
 
-Open <http://localhost:8080>. The local override builds the source and binds only to your computer's loopback interface.
+Open <http://localhost:8080>. Compose builds this checkout's `Dockerfile` as the local image `assppweb:local`; the local override binds only to your computer's loopback interface.
 
 ### Deploy to Cloudflare
 
@@ -38,7 +38,7 @@ For an existing Workers Builds connection to this repository's `main` branch, pu
 
 After deployment, `/api/settings` reports `appleAuthProtocol: "native-store-amd-v1"`. `/api/store-proof/health` reports `ready` after the native helper has initialized. Both endpoints use the existing access protection when configured.
 
-The upstream `ghcr.io/lakr233/assppweb:latest` image is separate from this fork's source build and does not automatically include these changes.
+The deployment methods below build this fork's source, including its native authentication and diagnostics changes.
 
 Requirements:
 
@@ -55,17 +55,18 @@ If your build log fails at `Deploy a container application` with `Unauthorized`,
 <details>
 <summary>Click to show Railway deployment instructions</summary>
 
-1. Go to [railway.com/new/image](https://railway.com/new/image) → enter `ghcr.io/lakr233/assppweb:latest`
-2. In service **Settings**, set **Healthcheck Path** to `/api/settings` and deploy
-3. Right-click the service → **Attach volume** → mount path: `/data`
-4. In **Variables**, set `DATA_DIR` = `/data` and deploy
-5. In **Settings** → **Networking**, generate a public domain or add a custom domain
+1. In the [Railway dashboard](https://railway.com/dashboard), create a project with **Deploy from GitHub repo** and connect [Sunalamye/AssppWeb](https://github.com/Sunalamye/AssppWeb). Grant the Railway GitHub app access to this repository; if deploying under another GitHub account, fork this repository into that account first.
+2. Select the `main` branch and keep the service root at the repository root. Railway [automatically detects the root `Dockerfile`](https://docs.railway.com/builds/dockerfiles) and builds the frontend, backend, and native proof helper together.
+3. In service **Settings**, set **Healthcheck Path** to `/api/settings`.
+4. Attach a volume with mount path `/data`; in **Variables**, set `DATA_DIR` = `/data` and `PORT` = `8080`, then deploy.
+5. In **Settings** → **Networking**, generate a public domain or add a custom domain, targeting port `8080`.
 
 **Notes**
 
 - The free trial works but has limitations (volume expiry, network restrictions). **Hobby** plan ($5/month) or above is recommended for reliable use.
 - Enable [**Serverless**](https://docs.railway.com/deployments/serverless) in service settings to scale down to zero during idle periods
-- Railway [auto-updates](https://docs.railway.com/deployments/image-auto-updates) `:latest` images from GHCR — new releases will be deployed automatically within a few hours
+- Railway [builds and deploys commits pushed to the connected GitHub branch](https://docs.railway.com/services#deploying-from-a-github-repo), subject to its deployment approval settings. If you deploy your own fork, update that fork to receive later changes.
+- The first uncached build downloads and verifies the native proof-runtime assets and can take longer than later builds.
 
 > **⚠️ Custom domain with Cloudflare:** Railway's Cloudflare integration creates DNS records with Proxy enabled (orange cloud) by default. After authorizing, go to Cloudflare DNS settings and switch the CNAME record to **DNS only** (gray cloud) — Railway handles TLS automatically. If you keep Cloudflare Proxy on, you must set SSL/TLS mode to **Full** (not Flexible or Full Strict), otherwise you'll get an infinite redirect loop. See [Railway docs](https://docs.railway.com/networking/troubleshooting/ssl#err_too_many_redirects).
 
@@ -79,9 +80,12 @@ If your build log fails at `Deploy a container application` with `Unauthorized`,
 **Setup Docker Compose**
 
 ```bash
-curl -O https://raw.githubusercontent.com/Lakr233/AssppWeb/main/compose.yml
-docker compose up -d
+git clone https://github.com/Sunalamye/AssppWeb.git
+cd AssppWeb
+docker compose up --build -d
 ```
+
+This builds the current checkout's `Dockerfile` as `assppweb:local` and stores compiled packages in `./mnt/asspp-data`. To update an existing checkout, pull the changes and run `docker compose up --build -d` again.
 
 **Environment Variables**
 
