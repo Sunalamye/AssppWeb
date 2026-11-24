@@ -469,7 +469,8 @@
       "deviceVerificationFailed": "Apple에서 이 기기를 확인할 수 없습니다. 계정 페이지에서 다시 인증한 후 라이선스를 받으세요.",
       "termsRequiredOnDevice": "App Store 이용 약관 동의가 필요합니다. 같은 Apple 계정으로 App Store를 열어 약관을 확인하고 동의한 후 다시 시도하세요.",
       "httpFailure": "Apple 구매 요청이 실패했습니다(HTTP {{status}}).",
-      "invalidResponse": "Apple 구매 응답을 읽을 수 없습니다(HTTP {{status}})."
+      "invalidResponse": "Apple 구매 응답을 읽을 수 없습니다(HTTP {{status}}).",
+      "regionUnavailable": "Apple에서 현재 국가 또는 지역에서 이 앱을 사용할 수 없다고 응답했습니다. Apple 계정의 스토어 지역, 서버 연결 위치, 동일 계정으로 공식 App Store에서 이용 가능한지 확인하세요."
     },
     "auth": {
       "requiresVerification": "2단계 인증 코드가 필요합니다. 인증 코드 팝업이 뜨지 않으면 https://account.apple.com 에 로그인하여 알림을 트리거한 후 2FA 코드 필드에 입력하세요.",
@@ -506,6 +507,7 @@
     "msgFailed": "{{appName}}\n{{userName}} / {{appleId}} - {{country}}\n\n오류: {{error}}",
     "downloadLimit": {
       "message": "{{appName}}\n앱 크기 {{size}} MB가 서버 제한 {{limit}} MB를 초과했습니다.\n관리자에게 문의하거나 자체 인스턴스를 배포하여 다시 시도하십시오."
-    }
+    },
+    "unknownStorefront": "알 수 없는 스토어 지역"
   }
 }

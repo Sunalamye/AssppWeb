@@ -63,6 +63,12 @@ describe('browser diagnostic boundary', () => {
       messagePresent: true,
       dialogKind: 'authorization',
       actionKind: 'missing',
+      storefrontId: '143465',
+      savedStorefrontId: '143465',
+      assignedStorefrontId: '143465',
+      requestedStorefrontId: '143441',
+      storefrontSource: 'apple_assigned',
+      catalogAppId: 1142110895,
     };
     const response = await request(app())
       .post('/api/diagnostics')
@@ -133,6 +139,13 @@ describe('browser diagnostic boundary', () => {
     { ...event, dialogPresent: 'true' },
     { ...event, actionPresent: 1 },
     { ...event, messagePresent: ['private-message'] },
+    { ...event, storefrontId: '143465-19,32' },
+    { ...event, savedStorefrontId: 'private-value' },
+    { ...event, assignedStorefrontId: '123456' },
+    { ...event, requestedStorefrontId: 143465 },
+    { ...event, storefrontSource: 'private-value' },
+    { ...event, catalogAppId: '1142110895' },
+    { ...event, catalogAppId: 10_000_000_000 },
   ])('rejects invalid values, nested objects, and arrays', async (input) => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const response = await request(app()).post('/api/diagnostics').set('X-Access-Token', 'fixture-access').send(input);
@@ -213,6 +226,8 @@ describe('browser diagnostic boundary', () => {
       'diagnosticStatusKinds',
       'diagnosticDialogKinds',
       'diagnosticActionKinds',
+      'diagnosticStorefrontFields',
+      'diagnosticStorefrontSources',
     ]) {
       const values = (source: string) => {
         const match = source.match(new RegExp(`export const ${name} = \\[([\\s\\S]*?)\\] as const;`));

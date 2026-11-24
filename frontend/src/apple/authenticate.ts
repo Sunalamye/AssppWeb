@@ -7,6 +7,7 @@ import { connectSAP } from './sap';
 import { toBase64 } from './sap/bytes';
 import { StoreProofClient } from './storeProof';
 import { createDiagnosticFlow, errorDiagnosticDetails, attachDiagnosticId } from '../utils/diagnostics';
+import { publicStorefrontId } from '../utils/storefront';
 import type { DiagnosticFlow, DiagnosticDetails } from '../utils/diagnostics';
 import type { StoreProofMode } from './storeProof';
 import type { SAPSigner } from './sap/signer';
@@ -152,6 +153,7 @@ interface AuthSession {
   cookies: Cookie[];
   storeFront: string;
   authoritativeStoreFront: boolean;
+  storefrontSource: DiagnosticDetails['storefrontSource'];
   endpoint: string;
   pod?: string;
   removedProof: boolean;
@@ -250,6 +252,7 @@ export class Authenticator {
       cookies: [...this.existingCookies],
       storeFront: '',
       authoritativeStoreFront: false,
+      storefrontSource: 'unset',
       endpoint,
       removedProof: false,
       provisioned: false,
@@ -389,8 +392,18 @@ export class Authenticator {
         if (assignedStoreFront) {
           session.storeFront = assignedStoreFront;
           session.authoritativeStoreFront = true;
+          session.storefrontSource = 'apple_assigned';
         } else if (requestedStoreFront && !session.authoritativeStoreFront) {
           session.storeFront = requestedStoreFront;
+          session.storefrontSource = 'request_echo';
+        }
+        if (assignedStoreFront || requestedStoreFront) {
+          currentFlow.log(stage, 'transition', {
+            assignedStorefrontId: publicStorefrontId(assignedStoreFront),
+            requestedStorefrontId: publicStorefrontId(requestedStoreFront),
+            storefrontId: publicStorefrontId(session.storeFront),
+            storefrontSource: session.storefrontSource,
+          });
         }
         const pod = response.headers.pod;
         if (pod && /^\d+$/.test(pod)) session.pod = pod;
@@ -516,15 +529,22 @@ export class Authenticator {
         const address = accountInfo.address ?? {};
         // A request-storefront echo is not an account-country change. Preserve
         // this same account's saved value unless Apple explicitly assigns one.
-        if (!session.authoritativeStoreFront && this.savedAccount?.directoryServicesIdentifier === dsid) {
-          const saved = this.savedAccount.storeFront?.trim() || this.savedAccount.store?.trim();
-          if (saved) session.storeFront = saved;
+        const savedStoreFront =
+          this.savedAccount?.directoryServicesIdentifier === dsid
+            ? this.savedAccount.storeFront?.trim() || this.savedAccount.store?.trim()
+            : undefined;
+        if (!session.authoritativeStoreFront && savedStoreFront) {
+          session.storeFront = savedStoreFront;
+          session.storefrontSource = 'saved_account';
         }
         currentFlow.log(stage, 'success', {
           httpStatus: response.status,
           mode: session.mode,
           durationMs: Date.now() - started,
           codeRequired: false,
+          savedStorefrontId: publicStorefrontId(savedStoreFront),
+          storefrontId: publicStorefrontId(session.storeFront),
+          storefrontSource: session.storefrontSource,
         });
         return {
           email,

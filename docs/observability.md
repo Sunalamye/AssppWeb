@@ -53,6 +53,31 @@ Non-200 responses may also contain a valid plist with useful error classificatio
 
 Already uploaded events cannot recover response fields that an older client omitted. An open tab also keeps its loaded JavaScript after a deployment. Reload the page before a post-deployment acceptance test, then verify that the browser events and bag/helper requests share one flow ID. Do not clear account storage merely to update the page.
 
+### Regional purchase denials
+
+`metrics.dialogId: MZCommerce.ContentBanned` is an explicit regional/content denial. The purchase interpreter reports `reason` and `purchaseBranch` as `region_unavailable`, displays localized guidance, and stops. It cannot become a successful or already-owned purchase, and it does not authorize the STDQ-to-GAME retry. HTTP 200 only describes the HTTP exchange.
+
+Use these public facts to distinguish account-store selection from the server's network location:
+
+| Field                   | Source and meaning                                                                                                                                                                |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `catalogAppId`          | The public numeric App Store catalog ID actually passed to `buyProduct`. No search term, app name, account ID, or request body is logged.                                         |
+| `storefrontId`          | At authentication, the selected public store ID; at purchase, the ID extracted from the exact outgoing storefront header. For example, `143465` is the China store.               |
+| `assignedStorefrontId`  | A known public ID from Apple's `X-Set-Apple-Store-Front` response, if supplied.                                                                                                   |
+| `requestedStorefrontId` | A known public ID from `X-Apple-Request-Store-Front`. This is a routing echo, not proof that the account's country changed.                                                       |
+| `savedStorefrontId`     | The existing account's known public ID, logged at successful authentication only after the returned account matches the saved one. The account identifier itself is never logged. |
+| `storefrontSource`      | `apple_assigned`, `saved_account`, `request_echo`, or `unset`, identifying how authentication selected its storefront.                                                            |
+
+Both diagnostic validators accept only exact store IDs from the application's country map. Complete storefront headers, suffixes, unknown IDs, and arbitrary strings are excluded. The catalog ID must be a positive integer of at most ten decimal digits. These remain untrusted browser reports, not authorization evidence.
+
+The license notification uses a per-operation snapshot of the actual store ID, including after account renewal. It must not render the pre-renewal account's country or read whichever account happens to be newest when a delayed failure arrives. An unavailable snapshot is shown as unknown. Search-country/entity changes also invalidate old results and in-flight lookups so old catalog metadata cannot be relabeled as belonging to a newly selected store.
+
+Apple TLS terminates in the browser, but its TCP connection leaves through this deployment's Wisp container. The account store, the user's location, the Worker edge, and the container's network location are separate facts. Apple's [App Store privacy notice](https://www.apple.com/legal/privacy/data/zh-tw/app-store/) says it may use the connection IP to estimate location when determining availability of regionally restricted apps. Neither a public App Store listing nor `ContentBanned` alone identifies which condition caused a particular denial.
+
+`wrangler.jsonc` constrains this deployment's container to `APAC`, retaining the existing application, Durable Object namespace, and `main` instance name. This avoids an unconstrained instance staying in North America after its initial request. Cloudflare's [regional placement constraint](https://developers.cloudflare.com/containers/concepts/placement/) does not promise a particular country, fixed egress IP, or Apple's geolocation result, and it does not guarantee that a regional denial will disappear.
+
+After a placement deployment, verify both application `constraints.regions` and the active instance's `location.region` through `/containers/applications/{application_id}/instances-v2`. Build success, a Worker colo, and a rollout percentage do not prove the instance has moved. Check the new image/start time and helper health before the next user test. Container restarts interrupt active Wisp/provisioning/download work and do not preserve its ephemeral disk; completed account and device state remain in the browser. Never clear browser credentials or device state merely to change container placement.
+
 ## State audit and guards
 
 | Path                    | States and transitions                                                                | Required guard / recovery                                                                                                                                                                            | Diagnostic stages                                             |
@@ -91,6 +116,7 @@ Cross-tab account coordination requires Web Locks; browsers without that API ret
 
 - `frontend/src/utils/diagnostics.ts` constructs events from an explicit allowlist. Stage, outcome, reason, endpoint, mode, response type, dialog classifications, purchase branches, and response-shape categories are enumerated. Error codes are bounded numeric codes or known helper codes.
 - `dialogCode` accepts only `MZCommerce`, `MZFinance`, or `MZCommerceInAppBuy` followed by bounded, dot-separated ASCII identifier segments, with a 160-character total limit. Both client and server validate the complete value. URL, email, whitespace, control characters, and arbitrary response/message fields are not accepted as dialog codes. A syntactically valid code is still an unverified client report and does not establish its business meaning.
+- Storefront fields accept only known public catalog store IDs; `storefrontSource` is enumerated and `catalogAppId` is a bounded positive integer. Only these selected public facts are extracted from the account/request context. No complete header or account object is attached to an error or sent to the diagnostic endpoint.
 - `POST /api/diagnostics` validates the same schema before writing a JSON line. It rejects unknown fields, oversized/invalid JSON, and cross-site browser requests, and uses the existing site access check. The route's 4 KiB parser runs before the application's large package-metadata parser.
 - The receiver has a bounded token bucket: burst 240, refill 4 events/second, at most 1,024 client buckets, and a 10-minute idle expiry. A shared proxy address can share a bucket. Rate limiting affects diagnostic delivery, not account operations.
 - Frontend transport has at most two concurrent uploads, a 200-event queue, and a five-second upload deadline. It does not retry business operations. Local history retains the latest 200 events and remains exportable if logging is unavailable. These are bounded diagnostics, not a durable offline event queue.
@@ -101,18 +127,19 @@ Cross-tab account coordination requires Web Locks; browsers without that API ret
 
 ## Interpreting common failures
 
-| Diagnostic                                    | Meaning / next check                                                                                                                                   |
-| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `authentication`, HTTP 204, `retry_exhausted` | Native Apple authentication still returned empty/transient responses after its bounded retry. Inspect preceding RP/SP/proof transitions.               |
-| `verification_required`                       | Continue on the account screen with a fresh verification code; acquiring a license must not bypass this state.                                         |
-| `terms_required`                              | Open the App Store with the same Apple account, review the terms, then retry. The application does not automatically accept legal terms.               |
-| `errorCode: 1008` / `device_verification`     | Apple did not accept device verification. Re-authenticate; inspect the proof/provisioning phases.                                                      |
-| `2034` / `2042` / `token_expired`             | Account credentials require renewal.                                                                                                                   |
-| `PROVISIONING_EXPIRED`                        | The pending native context expired or was already consumed. Start a new sign-in; do not replay the finish.                                             |
-| `storage`                                     | Browser state could not be read/saved, or backend task persistence failed. Identify the stage/source before retrying.                                  |
-| `lock` + `busy`                               | An overlapping action/reset was blocked rather than allowed to race.                                                                                   |
-| `download_enqueue` failure/timeout            | Check the downloaded-task list: a lost response does not prove enqueue failed on the server. There is no cross-restart exactly-once enqueue guarantee. |
-| Wisp `reason 2`                               | Voluntary stream closure; it is not an Apple HTTP error code.                                                                                          |
+| Diagnostic                                        | Meaning / next check                                                                                                                                                                                                                          |
+| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `authentication`, HTTP 204, `retry_exhausted`     | Native Apple authentication still returned empty/transient responses after its bounded retry. Inspect preceding RP/SP/proof transitions.                                                                                                      |
+| `verification_required`                           | Continue on the account screen with a fresh verification code; acquiring a license must not bypass this state.                                                                                                                                |
+| `terms_required`                                  | Open the App Store with the same Apple account, review the terms, then retry. The application does not automatically accept legal terms.                                                                                                      |
+| `MZCommerce.ContentBanned` / `region_unavailable` | Apple denied regional/content availability. Check the actual purchase `storefrontId`, `catalogAppId`, active container placement, and availability with the same account in the official App Store. Do not automatically replay the purchase. |
+| `errorCode: 1008` / `device_verification`         | Apple did not accept device verification. Re-authenticate; inspect the proof/provisioning phases.                                                                                                                                             |
+| `2034` / `2042` / `token_expired`                 | Account credentials require renewal.                                                                                                                                                                                                          |
+| `PROVISIONING_EXPIRED`                            | The pending native context expired or was already consumed. Start a new sign-in; do not replay the finish.                                                                                                                                    |
+| `storage`                                         | Browser state could not be read/saved, or backend task persistence failed. Identify the stage/source before retrying.                                                                                                                         |
+| `lock` + `busy`                                   | An overlapping action/reset was blocked rather than allowed to race.                                                                                                                                                                          |
+| `download_enqueue` failure/timeout                | Check the downloaded-task list: a lost response does not prove enqueue failed on the server. There is no cross-restart exactly-once enqueue guarantee.                                                                                        |
+| Wisp `reason 2`                                   | Voluntary stream closure; it is not an Apple HTTP error code.                                                                                                                                                                                 |
 
 ## Verification commands
 

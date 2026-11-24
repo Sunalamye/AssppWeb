@@ -81,6 +81,52 @@ describe('apple/purchase', () => {
     expect(vi.mocked(appleRequest).mock.calls[0][0].headers?.['X-Apple-Store-Front']).toBe('143441-1,29');
   });
 
+  it.each(['', '2059', '5002'])(
+    'classifies ContentBanned as a terminal regional denial despite failureType %j',
+    async (failureType) => {
+      const chinaApp = { ...app, id: 1142110895 };
+      respondWith({
+        failureType,
+        metrics: { dialogId: 'MZCommerce.ContentBanned' },
+        dialog: { explanation: 'This app is unavailable in the country or region you’re in.' },
+      });
+      // Deliberately stale account.store must not override the actual wire header.
+      const error = await purchaseApp({ ...account, storeFront: '143465-19,32' }, chinaApp).catch((error) => error);
+      expect(error).toBeInstanceOf(PurchaseError);
+      expect(error.diagnostics).toMatchObject({
+        reason: 'region_unavailable',
+        purchaseBranch: 'region_unavailable',
+        dialogCode: 'MZCommerce.ContentBanned',
+        storefrontId: '143465',
+        catalogAppId: 1142110895,
+        httpStatus: 200,
+      });
+      expect(error.message).toContain('storefront=143465');
+      expect(appleRequest).toHaveBeenCalledTimes(1);
+      const events = getDiagnosticEvents().filter((event) => event.stage === 'purchase');
+      expect(events.map((event) => event.outcome)).toEqual(['start', 'transition', 'failure']);
+      expect(events.every((event) => event.storefrontId === '143465' && event.catalogAppId === 1142110895)).toBe(true);
+      expect(JSON.stringify(events)).not.toContain('143465-19,32');
+    },
+  );
+
+  it('does not log unknown storefront values or non-catalog identifiers', async () => {
+    respondWith({ jingleDocType: 'purchaseSuccess', status: 0 });
+    await purchaseApp({ ...account, storeFront: 'PRIVATE_STOREFRONT' }, { ...app, id: 'PRIVATE_APP_ID' } as never);
+    const events = getDiagnosticEvents();
+    expect(events.every((event) => event.storefrontId === undefined && event.catalogAppId === undefined)).toBe(true);
+    expect(JSON.stringify(events)).not.toContain('PRIVATE_');
+  });
+
+  it('does not accept a success-shaped response that carries a ContentBanned marker without a dialog', async () => {
+    respondWith({ jingleDocType: 'purchaseSuccess', status: 0, metrics: { dialogId: 'MZCommerce.ContentBanned' } });
+    await expect(purchaseApp(account, app)).rejects.toMatchObject({
+      diagnostics: { reason: 'region_unavailable', purchaseBranch: 'region_unavailable', dialogPresent: false },
+    });
+    expect(appleRequest).toHaveBeenCalledTimes(1);
+    expect(getDiagnosticEvents().some((event) => event.outcome === 'success' || event.outcome === 'retry')).toBe(false);
+  });
+
   it('still rejects other failure types carrying the generic message', async () => {
     respondWith({
       failureType: '1008',

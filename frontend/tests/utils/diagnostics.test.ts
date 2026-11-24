@@ -4,6 +4,9 @@ import {
   validAppleDialogCode as validBackendAppleDialogCode,
   validateDiagnosticEvent,
 } from '../../../backend/src/utils/diagnostics';
+import { validStorefrontId as validBackendStorefrontId } from '../../../backend/src/utils/storefront';
+import { countryCodeMap } from '../../src/apple/config';
+import { publicStorefrontId, validStorefrontId } from '../../src/utils/storefront';
 import {
   attachDiagnosticId,
   clearDiagnosticEvents,
@@ -13,6 +16,8 @@ import {
   diagnosticFailureTypeKinds,
   diagnosticPurchaseBranches,
   diagnosticStatusKinds,
+  diagnosticStorefrontFields,
+  diagnosticStorefrontSources,
   errorDiagnosticDetails,
   getDiagnosticEvents,
   getDiagnosticId,
@@ -241,6 +246,7 @@ describe('purchase diagnostic schema agreement', () => {
       statusKind: diagnosticStatusKinds,
       dialogKind: diagnosticDialogKinds,
       actionKind: diagnosticActionKinds,
+      storefrontSource: diagnosticStorefrontSources,
       dialogPresent: [true, false],
       actionPresent: [true, false],
       messagePresent: [true, false],
@@ -264,6 +270,7 @@ describe('purchase diagnostic schema agreement', () => {
       'dialogPresent',
       'actionPresent',
       'messagePresent',
+      'storefrontSource',
     ]) {
       for (const value of ['PRIVATE_TOKEN', 'true', 0, 1, null, { password: 'PRIVATE_PASSWORD' }, ['PRIVATE_TOKEN']]) {
         const details = { [key]: value };
@@ -287,5 +294,43 @@ describe('purchase diagnostic schema agreement', () => {
     expect(safeDiagnosticDetails({ dialog: 'MZFinance.Account.NotFound2' } as never)).toEqual({});
     expect(validateDiagnosticEvent({ ...baseEvent, dialog: 'MZFinance.Account.NotFound2' })).toBeUndefined();
     expect(validateDiagnosticEvent(baseEvent)).toEqual(baseEvent);
+  });
+
+  it('accepts only the known public storefront IDs on both sides of the logging boundary', () => {
+    const known = new Set(Object.values(countryCodeMap));
+    for (let value = 143000; value < 144000; value++) {
+      const id = String(value);
+      expect(validStorefrontId(id)).toBe(known.has(id));
+      expect(validBackendStorefrontId(id)).toBe(known.has(id));
+    }
+    for (const id of known) {
+      for (const key of diagnosticStorefrontFields) {
+        const details = { [key]: id };
+        expect(safeDiagnosticDetails(details)).toEqual(details);
+        expect(validateDiagnosticEvent({ ...baseEvent, ...details })).toEqual({ ...baseEvent, ...details });
+      }
+    }
+    expect(publicStorefrontId('143465-19,32')).toBe('143465');
+    expect(publicStorefrontId('143470')).toBe('143470');
+    expect(publicStorefrontId('PRIVATE_HEADER')).toBeUndefined();
+    for (const value of ['143465-19,32', '143465\n', '000000', 143465, 'PRIVATE_TOKEN', null]) {
+      for (const key of diagnosticStorefrontFields) {
+        const details = { [key]: value };
+        expect(safeDiagnosticDetails(details as never)).toEqual({});
+        expect(validateDiagnosticEvent({ ...baseEvent, ...details })).toBeUndefined();
+      }
+    }
+  });
+
+  it('retains a public numeric catalog ID but rejects strings and unbounded identifiers', () => {
+    for (const catalogAppId of [1, 1142110895, 9_999_999_999]) {
+      const details = { catalogAppId };
+      expect(safeDiagnosticDetails(details)).toEqual(details);
+      expect(validateDiagnosticEvent({ ...baseEvent, ...details })).toEqual({ ...baseEvent, ...details });
+    }
+    for (const catalogAppId of [0, -1, 1.5, 10_000_000_000, NaN, Infinity, '1142110895', 'PRIVATE_TOKEN', null]) {
+      expect(safeDiagnosticDetails({ catalogAppId } as never)).toEqual({});
+      expect(validateDiagnosticEvent({ ...baseEvent, catalogAppId })).toBeUndefined();
+    }
   });
 });

@@ -7,6 +7,7 @@ interface SearchState {
   country: string;
   entity: string;
   results: Software[];
+  resultsCountry: string | null;
   loading: boolean;
   error: string | null;
   setSearchParam: (param: Partial<Pick<SearchState, 'term' | 'country' | 'entity'>>) => void;
@@ -15,42 +16,65 @@ interface SearchState {
   clear: () => void; // 新增：清空搜索状态的方法
 }
 
-export const useSearch = create<SearchState>((set) => ({
-  term: '',
-  country: '',
-  entity: '',
-  results: [],
-  loading: false,
-  error: null,
-  setSearchParam: (param) => set((state) => ({ ...state, ...param })),
-  search: async (term, country, entity) => {
-    set({ loading: true, error: null, term, country, entity });
-    try {
-      const apps = await searchApps(term, country, entity);
-      set({ results: apps });
-    } catch (e) {
-      set({
-        error: e instanceof Error ? e.message : 'Search failed',
-        results: [],
-      });
-    } finally {
-      set({ loading: false });
-    }
-  },
-  lookup: async (bundleId, country) => {
-    set({ loading: true, error: null });
-    try {
-      const app = await lookupApp(bundleId, country);
-      set({ results: app ? [app] : [] });
-    } catch (e) {
-      set({
-        error: e instanceof Error ? e.message : 'Lookup failed',
-        results: [],
-      });
-    } finally {
-      set({ loading: false });
-    }
-  },
-  // 清空关键词、结果和错误信息，但保留选择的国家和设备类型（作为用户偏好）
-  clear: () => set({ term: '', results: [], error: null }),
-}));
+export const useSearch = create<SearchState>((set) => {
+  let generation = 0;
+  return {
+    term: '',
+    country: '',
+    entity: '',
+    results: [],
+    resultsCountry: null,
+    loading: false,
+    error: null,
+    setSearchParam: (param) =>
+      set((state) => {
+        const changedFilter =
+          (param.country !== undefined && param.country !== state.country) ||
+          (param.entity !== undefined && param.entity !== state.entity);
+        if (!changedFilter) return param;
+        generation++;
+        return { ...param, results: [], resultsCountry: null, loading: false, error: null };
+      }),
+    search: async (term, country, entity) => {
+      const request = ++generation;
+      set({ loading: true, error: null, term, country, entity, results: [], resultsCountry: null });
+      try {
+        const apps = await searchApps(term, country, entity);
+        if (request === generation) set({ results: apps, resultsCountry: country });
+      } catch (e) {
+        if (request === generation) {
+          set({
+            error: e instanceof Error ? e.message : 'Search failed',
+            results: [],
+            resultsCountry: null,
+          });
+        }
+      } finally {
+        if (request === generation) set({ loading: false });
+      }
+    },
+    lookup: async (bundleId, country) => {
+      const request = ++generation;
+      set({ loading: true, error: null, country, results: [], resultsCountry: null });
+      try {
+        const app = await lookupApp(bundleId, country);
+        if (request === generation) set({ results: app ? [app] : [], resultsCountry: country });
+      } catch (e) {
+        if (request === generation) {
+          set({
+            error: e instanceof Error ? e.message : 'Lookup failed',
+            results: [],
+            resultsCountry: null,
+          });
+        }
+      } finally {
+        if (request === generation) set({ loading: false });
+      }
+    },
+    // Keep the chosen filters, but prevent an older request from restoring cleared results.
+    clear: () => {
+      generation++;
+      set({ term: '', results: [], resultsCountry: null, error: null, loading: false });
+    },
+  };
+});

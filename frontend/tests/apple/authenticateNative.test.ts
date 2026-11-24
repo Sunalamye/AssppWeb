@@ -79,6 +79,7 @@ function helper(mode: 'store' | 'bootstrap' = 'store') {
 describe('native authentication with machine provisioning', () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    clearDiagnosticEvents();
     vi.mocked(fetchBag).mockResolvedValue({ authURL: endpoint });
     const sign = vi.fn(async () => Uint8Array.of(sign.mock.calls.length));
     vi.mocked(connectSAP).mockResolvedValue({ sign });
@@ -97,6 +98,15 @@ describe('native authentication with machine provisioning', () => {
       store: '143462',
       storeFront: '143462-1,29',
     });
+    expect(getDiagnosticEvents()).toContainEqual(
+      expect.objectContaining({
+        stage: 'authentication',
+        outcome: 'success',
+        storefrontId: '143462',
+        savedStorefrontId: '143462',
+        storefrontSource: 'saved_account',
+      }),
+    );
   });
 
   it('accepts an authoritative storefront assignment instead of preserving the saved value', async () => {
@@ -113,6 +123,29 @@ describe('native authentication with machine provisioning', () => {
       store: '143441',
       storeFront: '143441-1,34',
     });
+    expect(getDiagnosticEvents()).toContainEqual(
+      expect.objectContaining({
+        stage: 'authentication',
+        outcome: 'transition',
+        assignedStorefrontId: '143441',
+        requestedStorefrontId: '143470',
+        storefrontId: '143441',
+        storefrontSource: 'apple_assigned',
+      }),
+    );
+    expect(getDiagnosticEvents()).toContainEqual(
+      expect.objectContaining({
+        stage: 'authentication',
+        outcome: 'success',
+        storefrontId: '143441',
+        savedStorefrontId: '143462',
+        storefrontSource: 'apple_assigned',
+      }),
+    );
+    const logs = JSON.stringify(getDiagnosticEvents());
+    for (const privateValue of ['private@example.invalid', 'private-password', 'private-token', '143441-1,34']) {
+      expect(logs).not.toContain(privateValue);
+    }
   });
 
   it('never reuses storefront state belonging to a different DSID', async () => {
@@ -127,6 +160,11 @@ describe('native authentication with machine provisioning', () => {
       store: '143470',
       storeFront: '143470-1,29',
     });
+    const completed = getDiagnosticEvents().find(
+      (event) => event.stage === 'authentication' && event.outcome === 'success',
+    );
+    expect(completed).toMatchObject({ storefrontId: '143470', storefrontSource: 'request_echo' });
+    expect(completed).not.toHaveProperty('savedStorefrontId');
   });
 
   it('keeps a storefront assignment across a later redirect response that only echoes routing', async () => {
@@ -145,6 +183,14 @@ describe('native authentication with machine provisioning', () => {
       .mockResolvedValueOnce(success());
     const account = await newAuth().authenticate('private@example.invalid', 'private-password');
     expect(account.storeFront).toBe('143441-1,34');
+    expect(getDiagnosticEvents()).toContainEqual(
+      expect.objectContaining({
+        stage: 'authentication',
+        outcome: 'success',
+        storefrontId: '143441',
+        storefrontSource: 'apple_assigned',
+      }),
+    );
   });
 
   it('completes RP -> SP -> browser finish -> 2FA without sending Apple credentials to the helper', async () => {

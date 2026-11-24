@@ -9,6 +9,7 @@ import {
   safeDiagnosticDetails,
   validAppleDialogCode,
 } from '../utils/diagnostics';
+import { publicStorefrontId } from '../utils/storefront';
 import { purchaseAPIHost } from './config';
 import type { AppleResponse } from './request';
 import type { DiagnosticDetails, DiagnosticFlow } from '../utils/diagnostics';
@@ -96,7 +97,11 @@ function actionKind(value: unknown): DiagnosticDetails['actionKind'] {
   }
 }
 
-function responseDetails(response: AppleResponse, dict: PurchaseDictionary = {}): DiagnosticDetails {
+function responseDetails(
+  response: AppleResponse,
+  dict: PurchaseDictionary = {},
+  context: DiagnosticDetails = {},
+): DiagnosticDetails {
   const metrics = dictionary(dict.metrics) ? dict.metrics : {};
   const document = text(dict.jingleDocType);
   const dialogCode = metrics.dialogId;
@@ -104,6 +109,7 @@ function responseDetails(response: AppleResponse, dict: PurchaseDictionary = {})
   const dialog = dictionary(dict.dialog) ? dict.dialog : {};
   const action = dictionary(dict.action) ? dict.action : {};
   return safeDiagnosticDetails({
+    ...context,
     endpoint: 'purchase',
     httpStatus: response.status,
     errorCode: failureCode(dict.failureType),
@@ -135,10 +141,11 @@ function purchaseFailure(message: string, details: DiagnosticDetails, code?: str
   else if (details.dialog && details.dialog !== 'missing') facts.push(`dialog=${details.dialog}`);
   if (details.purchaseBranch) facts.push(`branch=${details.purchaseBranch}`);
   if (details.statusKind) facts.push(`status=${details.statusKind}`);
+  if (details.storefrontId) facts.push(`storefront=${details.storefrontId}`);
   return new PurchaseError(`${message} [${facts.join('; ')}]`, code, details);
 }
 
-function parseResponse(response: AppleResponse): PurchaseDictionary {
+function parseResponse(response: AppleResponse, context: DiagnosticDetails): PurchaseDictionary {
   let dict: PurchaseDictionary | undefined;
   try {
     const parsed: unknown = parsePlist(response.body);
@@ -148,14 +155,14 @@ function parseResponse(response: AppleResponse): PurchaseDictionary {
   }
   if (response.status !== 200) {
     throw purchaseFailure(i18n.t('errors.purchase.httpFailure', { status: response.status }), {
-      ...responseDetails(response, dict),
+      ...responseDetails(response, dict, context),
       reason: response.status >= 300 && response.status < 400 ? 'redirect' : 'http_error',
       purchaseBranch: 'http_error',
     });
   }
   if (dict) return dict;
   throw purchaseFailure(i18n.t('errors.purchase.invalidResponse', { status: response.status }), {
-    ...responseDetails(response),
+    ...responseDetails(response, {}, context),
     reason: response.body.trim() ? 'invalid_plist' : 'empty_response',
     purchaseBranch: 'invalid_plist',
   });
@@ -186,8 +193,9 @@ function interpretResponse(
   response: AppleResponse,
   dict: PurchaseDictionary,
   cookies: Account['cookies'],
+  context: DiagnosticDetails,
 ): PurchaseResult {
-  const details = responseDetails(response, dict);
+  const details = responseDetails(response, dict, context);
   const code = failureCode(dict.failureType);
   const customerMessage = text(dict.customerMessage);
   const dialog = dictionary(dict.dialog) ? dict.dialog : {};
@@ -234,6 +242,12 @@ function interpretResponse(
   }
   if (customerMessage === 'Subscription Required')
     fail(i18n.t('errors.purchase.subscriptionRequired'), 'subscription_required', 'subscription_required');
+
+  // This explicit Apple denial is terminal, even if other fields resemble an
+  // already-owned response or a retryable availability failure.
+  if (details.dialogCode === 'MZCommerce.ContentBanned') {
+    fail(i18n.t('errors.purchase.regionUnavailable'), 'region_unavailable', 'region_unavailable');
+  }
 
   // A contradictory dialog/action/status cannot be reclassified as success or
   // an automatic retry, even if it is accompanied by a familiar numeric code.
@@ -284,7 +298,12 @@ export async function purchaseApp(
   const flow = diagnostics ?? createDiagnosticFlow('license');
   const started = Date.now();
   let attempt = 0;
-  flow.log('purchase', 'start', { endpoint: 'purchase' });
+  const storeFront = account.storeFront || (account.store.includes('-') ? account.store : `${account.store}-1`);
+  const context = safeDiagnosticDetails({
+    storefrontId: publicStorefrontId(storeFront),
+    catalogAppId: app.id,
+  });
+  flow.log('purchase', 'start', { ...context, endpoint: 'purchase' });
   try {
     if ((app.price ?? 0) > 0) {
       throw new PurchaseError(i18n.t('errors.purchase.paidNotSupported'), undefined, { reason: 'paid_app' });
@@ -300,8 +319,7 @@ export async function purchaseApp(
           'Content-Type': 'application/x-apple-plist',
           'iCloud-DSID': account.directoryServicesIdentifier,
           'X-Dsid': account.directoryServicesIdentifier,
-          'X-Apple-Store-Front':
-            account.storeFront || (account.store.includes('-') ? account.store : `${account.store}-1`),
+          'X-Apple-Store-Front': storeFront,
           'X-Token': account.passwordToken,
         },
         body: buildPlist({
@@ -322,12 +340,12 @@ export async function purchaseApp(
         diagnostics: flow,
       });
       cookies = extractAndMergeCookies(response.rawHeaders, cookies);
-      const dict = parseResponse(response);
-      flow.log('purchase', 'transition', { ...responseDetails(response, dict), attempt });
+      const dict = parseResponse(response, context);
+      flow.log('purchase', 'transition', { ...responseDetails(response, dict, context), attempt });
       try {
-        const result = interpretResponse(response, dict, cookies);
+        const result = interpretResponse(response, dict, cookies, context);
         flow.log('purchase', 'success', {
-          ...responseDetails(response, dict),
+          ...responseDetails(response, dict, context),
           attempt,
           alreadyOwned: result.alreadyOwned,
           purchaseBranch: result.alreadyOwned ? 'already_owned' : 'success',
@@ -351,6 +369,7 @@ export async function purchaseApp(
   } catch (error) {
     flow.log('purchase', 'failure', {
       ...errorDiagnosticDetails(error),
+      ...context,
       endpoint: 'purchase',
       attempt,
       durationMs: Date.now() - started,

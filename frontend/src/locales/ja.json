@@ -469,7 +469,8 @@
       "deviceVerificationFailed": "Apple がこのデバイスを確認できませんでした。アカウント画面で再認証してからライセンスを取得してください。",
       "termsRequiredOnDevice": "App Store の利用規約への同意が必要です。同じ Apple アカウントで App Store を開き、規約を確認して同意した後に再試行してください。",
       "httpFailure": "Apple への購入リクエストが失敗しました（HTTP {{status}}）。",
-      "invalidResponse": "Apple の購入応答を読み取れませんでした（HTTP {{status}}）。"
+      "invalidResponse": "Apple の購入応答を読み取れませんでした（HTTP {{status}}）。",
+      "regionUnavailable": "Apple は、このアプリが現在の国または地域では利用できないと通知しています。Apple Account のストアの地域、サーバーの接続元地域、同じアカウントでの公式 App Store の提供状況を確認してください。"
     },
     "auth": {
       "requiresVerification": "2ファクタ認証コードが必要です。ポップアップが出ない場合は、https://account.apple.com でサインインしてアラートをトリガーし、コード欄に入力してください。",
@@ -506,6 +507,7 @@
     "msgFailed": "{{appName}}\n{{userName}} / {{appleId}} - {{country}}\n\nエラー: {{error}}",
     "downloadLimit": {
       "message": "{{appName}}\nアプリのサイズ {{size}} MB がサーバーの制限 {{limit}} MB を超えています。\n管理者に連絡するか、ご自身でサーバーを展開して再試行してください。"
-    }
+    },
+    "unknownStorefront": "ストアの地域不明"
   }
 }

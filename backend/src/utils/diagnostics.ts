@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { validStorefrontId } from './storefront.js';
 import type { Request, Response } from 'express';
 
 // Keep the public schema aligned with frontend/src/utils/diagnostics.ts.
@@ -84,6 +85,7 @@ export const diagnosticReasons = [
   'subscription_required',
   'license_required',
   'version_mismatch',
+  'region_unavailable',
 ] as const;
 export const diagnosticEndpoints = [
   'native_auth',
@@ -127,6 +129,7 @@ export const diagnosticPurchaseBranches = [
   'device_verification',
   'token_expired',
   'subscription_required',
+  'region_unavailable',
   'dialog_present',
   'action_present',
   'invalid_status',
@@ -150,6 +153,13 @@ export const diagnosticDialogKinds = [
   'other',
 ] as const;
 export const diagnosticActionKinds = ['missing', 'Goto', 'Buy', 'Download', 'SignIn', 'other'] as const;
+export const diagnosticStorefrontSources = ['apple_assigned', 'saved_account', 'request_echo', 'unset'] as const;
+export const diagnosticStorefrontFields = [
+  'storefrontId',
+  'savedStorefrontId',
+  'assignedStorefrontId',
+  'requestedStorefrontId',
+] as const;
 
 /** Syntax for Apple protocol identifiers only; never pass arbitrary messages here. */
 export function validAppleDialogCode(value: unknown): value is string {
@@ -186,6 +196,12 @@ export interface DiagnosticDetails {
   messagePresent?: boolean;
   dialogKind?: (typeof diagnosticDialogKinds)[number];
   actionKind?: (typeof diagnosticActionKinds)[number];
+  storefrontId?: string;
+  savedStorefrontId?: string;
+  assignedStorefrontId?: string;
+  requestedStorefrontId?: string;
+  storefrontSource?: (typeof diagnosticStorefrontSources)[number];
+  catalogAppId?: number;
   action?: 'RP' | 'SP';
   responseType?: 'purchaseSuccess' | 'buyProductFailure' | 'other' | 'missing';
   dialog?:
@@ -232,6 +248,9 @@ const detailFields = [
   'messagePresent',
   'dialogKind',
   'actionKind',
+  ...diagnosticStorefrontFields,
+  'storefrontSource',
+  'catalogAppId',
 ] as const;
 const allowedFields = new Set<string>([...requiredFields, ...detailFields]);
 const stringDetails: Record<string, readonly string[]> = {
@@ -252,6 +271,7 @@ const stringDetails: Record<string, readonly string[]> = {
   statusKind: diagnosticStatusKinds,
   dialogKind: diagnosticDialogKinds,
   actionKind: diagnosticActionKinds,
+  storefrontSource: diagnosticStorefrontSources,
 };
 
 export function validDiagnosticId(value: unknown): value is string {
@@ -276,6 +296,9 @@ function validDetail(key: string, value: unknown): boolean {
   }
   if (key === 'errorCode') return validDiagnosticErrorCode(value);
   if (key === 'dialogCode') return validAppleDialogCode(value);
+  if ((diagnosticStorefrontFields as readonly string[]).includes(key)) return validStorefrontId(value);
+  if (key === 'catalogAppId')
+    return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 && value <= 9_999_999_999;
   if (Object.hasOwn(stringDetails, key)) return includes(stringDetails[key], value);
   return (
     ['alreadyOwned', 'codeRequired', 'statePresent', 'dialogPresent', 'actionPresent', 'messagePresent'].includes(

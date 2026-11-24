@@ -8,6 +8,7 @@ import { listVersions } from '../../src/apple/versionFinder';
 import { getVersionMetadata } from '../../src/apple/versionLookup';
 import { apiGet, apiPost } from '../../src/api/client';
 import { clearDiagnosticEvents, getDiagnosticEvents, getDiagnosticId } from '../../src/utils/diagnostics';
+import { licenseStorefrontForError } from '../../src/utils/licenseContext';
 import type { Account, Cookie, Software } from '../../src/types';
 
 const mocks = vi.hoisted(() => ({
@@ -15,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   updateAccount: vi.fn(),
   addToast: vi.fn(),
   fetchTasks: vi.fn(),
+  translate: vi.fn(),
 }));
 
 vi.mock('../../src/i18n', () => ({ default: { t: (key: string) => key } }));
@@ -22,10 +24,15 @@ vi.mock('../../src/i18n', () => ({ default: { t: (key: string) => key } }));
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, options?: Record<string, unknown>) => {
+      mocks.translate(key, options);
       if (key === 'errors.purchase.verificationRequired')
         return 'Open Accounts and complete the verification code before trying again.';
       if (key === 'errors.purchase.paidNotSupported') return 'Purchasing paid apps is not supported';
       if (key === 'errors.download.enqueueUncertain') return 'Check the download list before retrying.';
+      if (key === 'toast.unknownStorefront') return 'Unknown storefront';
+      if (key === 'countries.CN') return 'China';
+      if (key === 'countries.US') return 'United States';
+      if (key === 'countries.JP') return 'Japan';
       if (key === 'toast.msgFailed') return options?.appName + '\nError: ' + options?.error;
       return key;
     },
@@ -228,6 +235,191 @@ describe('useDownloadAction.acquireLicense', () => {
     await result.current.acquireLicense(account, app);
     expect(mocks.updateAccount).toHaveBeenNthCalledWith(2, renewed, flowShape);
     expect(mocks.addToast).toHaveBeenCalledWith('toast.msg', 'success', 'toast.title.licenseOwned');
+  });
+
+  it('uses the refreshed account in success notifications when its storefront changes', async () => {
+    const chinaAccount = { ...account, store: '143465', storeFront: '143465-1,29' };
+    const refreshedAccount = { ...renewed, firstName: 'Refreshed', lastName: 'Name' };
+    mocks.readAccount.mockResolvedValue(chinaAccount);
+    vi.mocked(authenticate).mockResolvedValue(refreshedAccount);
+    const { result } = renderHook(() => useDownloadAction());
+
+    await result.current.acquireLicense(chinaAccount, app);
+
+    expect(purchaseApp).toHaveBeenCalledWith(refreshedAccount, app, flowShape);
+    expect(mocks.translate).toHaveBeenCalledWith(
+      'toast.msg',
+      expect.objectContaining({ country: 'United States', userName: 'Refreshed Name' }),
+    );
+  });
+
+  it.each([false, true])(
+    'uses the persisted account storefront for authentication failures (code required: %s)',
+    async (codeRequired) => {
+      const current = { ...account, store: '143465', storeFront: '143465-1,29' };
+      mocks.readAccount.mockResolvedValue(current);
+      vi.mocked(authenticate).mockRejectedValue(new AuthenticationError('Authentication failed', codeRequired));
+      const { result } = renderHook(() => useDownloadAction());
+
+      const failure = await result.current.acquireLicense(account, app).catch((error: unknown) => error);
+      result.current.toastLicenseError(account, app, failure);
+
+      expect(licenseStorefrontForError(failure)).toBe('143465');
+      expect(mocks.translate).toHaveBeenCalledWith(
+        'toast.msgFailed',
+        expect.objectContaining({ country: 'China (143465)' }),
+      );
+      expect(purchaseApp).not.toHaveBeenCalled();
+      if (codeRequired) expect(failure).toMatchObject({ codeRequired: true });
+    },
+  );
+
+  it.each(['before purchase', 'after purchase'])(
+    'uses the refreshed storefront when saving fails %s',
+    async (phase) => {
+      const current = { ...account, store: '143465', storeFront: '143465-1,29' };
+      const refreshedAccount = { ...renewed, store: '143462', storeFront: '143462-1,32' };
+      const failure = new Error('Could not save the account');
+      mocks.readAccount.mockResolvedValue(current);
+      vi.mocked(authenticate).mockResolvedValue(refreshedAccount);
+      if (phase === 'after purchase') mocks.updateAccount.mockResolvedValueOnce(undefined);
+      mocks.updateAccount.mockRejectedValue(failure);
+      const { result } = renderHook(() => useDownloadAction());
+
+      await expect(result.current.acquireLicense(account, app)).rejects.toBe(failure);
+      expect(mocks.addToast).not.toHaveBeenCalled();
+      result.current.toastLicenseError(account, app, failure);
+
+      expect(licenseStorefrontForError(failure)).toBe('143462');
+      expect(mocks.translate).toHaveBeenCalledWith(
+        'toast.msgFailed',
+        expect.objectContaining({ country: 'Japan (143462)' }),
+      );
+      expect(purchaseApp).toHaveBeenCalledTimes(phase === 'before purchase' ? 0 : 1);
+    },
+  );
+
+  it('prefers the validated storefront actually sent by the failed purchase', async () => {
+    const failure = Object.assign(new PurchaseError('Unavailable in this region'), {
+      diagnostics: { storefrontId: '143462' },
+    });
+    vi.mocked(purchaseApp).mockRejectedValue(failure);
+    const { result } = renderHook(() => useDownloadAction());
+
+    await expect(result.current.acquireLicense(account, app)).rejects.toBe(failure);
+    result.current.toastLicenseError(account, app, failure);
+
+    expect(licenseStorefrontForError(failure)).toBe('143462');
+    expect(mocks.translate).toHaveBeenCalledWith(
+      'toast.msgFailed',
+      expect.objectContaining({ country: 'Japan (143462)' }),
+    );
+  });
+
+  it('keeps the operation storefront for frozen errors without retaining an account on the error', async () => {
+    const refreshedAccount = { ...renewed, store: '143465', storeFront: '143441-1,32' };
+    const failure = Object.freeze(new Error('Purchase failed'));
+    const originalProperties = Object.getOwnPropertyDescriptors(failure);
+    vi.mocked(authenticate).mockResolvedValue(refreshedAccount);
+    vi.mocked(purchaseApp).mockRejectedValue(failure);
+    const { result } = renderHook(() => useDownloadAction());
+
+    await expect(result.current.acquireLicense(account, app)).rejects.toBe(failure);
+    result.current.toastLicenseError(refreshedAccount, app, failure);
+
+    expect(licenseStorefrontForError(failure)).toBe('143441');
+    expect(Object.getOwnPropertyDescriptors(failure)).toEqual(originalProperties);
+    expect(mocks.translate).toHaveBeenCalledWith(
+      'toast.msgFailed',
+      expect.objectContaining({ country: 'United States (143441)' }),
+    );
+    const observed = JSON.stringify([failure, getDiagnosticEvents()]);
+    for (const secret of [
+      refreshedAccount.email,
+      refreshedAccount.password,
+      refreshedAccount.passwordToken,
+      refreshedAccount.cookies[0].value,
+      refreshedAccount.directoryServicesIdentifier,
+      refreshedAccount.storeFront,
+    ]) {
+      expect(observed).not.toContain(secret);
+    }
+  });
+
+  it('does not accept an unvalidated storefront from purchase diagnostics', async () => {
+    const failure = Object.assign(new Error('Purchase failed'), {
+      diagnostics: { storefrontId: '143465-private-value' },
+    });
+    vi.mocked(purchaseApp).mockRejectedValue(failure);
+    const { result } = renderHook(() => useDownloadAction());
+
+    await expect(result.current.acquireLicense(account, app)).rejects.toBe(failure);
+    result.current.toastLicenseError(account, app, failure);
+
+    expect(licenseStorefrontForError(failure)).toBe('143441');
+    expect(mocks.translate).toHaveBeenCalledWith(
+      'toast.msgFailed',
+      expect.objectContaining({ country: 'United States (143441)' }),
+    );
+    expect(JSON.stringify(getDiagnosticEvents())).not.toContain('private-value');
+  });
+
+  it('shows an unknown storefront if no persisted account could be read', async () => {
+    const failure = new Error('Account storage failed');
+    mocks.readAccount.mockRejectedValue(failure);
+    const { result } = renderHook(() => useDownloadAction());
+
+    await expect(result.current.acquireLicense(account, app)).rejects.toBe(failure);
+    result.current.toastLicenseError(account, app, failure);
+
+    expect(licenseStorefrontForError(failure)).toBeUndefined();
+    expect(mocks.translate).toHaveBeenCalledWith(
+      'toast.msgFailed',
+      expect.objectContaining({ country: 'Unknown storefront' }),
+    );
+    expect(authenticate).not.toHaveBeenCalled();
+    expect(purchaseApp).not.toHaveBeenCalled();
+  });
+
+  it('keeps the error storefront tied to each operation across accounts and later state changes', async () => {
+    const secondAccount = { ...account, email: 'second@example.invalid' };
+    const firstRefreshed = { ...renewed, store: '143465', storeFront: '143465-1,32' };
+    const secondRefreshed = { ...secondAccount, store: '143462', storeFront: '143462-1,32' };
+    const firstFailure = new Error('First purchase failed');
+    const secondFailure = new Error('Second purchase failed');
+    mocks.readAccount.mockImplementation(async (email: string) => (email === account.email ? account : secondAccount));
+    vi.mocked(authenticate).mockImplementation(async (email: string) =>
+      email === account.email ? firstRefreshed : secondRefreshed,
+    );
+    vi.mocked(purchaseApp).mockImplementation(async (current) => {
+      throw current.email === account.email ? firstFailure : secondFailure;
+    });
+    const { result } = renderHook(() => useDownloadAction());
+
+    const results = await Promise.allSettled([
+      result.current.acquireLicense(account, app),
+      result.current.acquireLicense(secondAccount, app),
+    ]);
+    expect(results).toEqual([
+      { status: 'rejected', reason: firstFailure },
+      { status: 'rejected', reason: secondFailure },
+    ]);
+    mocks.readAccount.mockResolvedValue(renewed);
+    mocks.readAccount.mockClear();
+    result.current.toastLicenseError(secondAccount, app, secondFailure);
+    result.current.toastLicenseError(account, app, firstFailure);
+
+    expect(mocks.readAccount).not.toHaveBeenCalled();
+    expect(licenseStorefrontForError(firstFailure)).toBe('143465');
+    expect(licenseStorefrontForError(secondFailure)).toBe('143462');
+    expect(mocks.translate).toHaveBeenCalledWith(
+      'toast.msgFailed',
+      expect.objectContaining({ country: 'China (143465)' }),
+    );
+    expect(mocks.translate).toHaveBeenCalledWith(
+      'toast.msgFailed',
+      expect.objectContaining({ country: 'Japan (143462)' }),
+    );
   });
 
   it('rejects paid apps before authentication or purchase', async () => {

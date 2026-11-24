@@ -16,7 +16,9 @@ export async function searchApps(
   return apiGet<Software[]>(`/api/search?${params}`);
 }
 
-export async function lookupApp(bundleId: string, country: string): Promise<Software | null> {
-  const params = new URLSearchParams({ bundleId, country });
+export async function lookupApp(identifier: string, country: string): Promise<Software | null> {
+  const value = identifier.trim();
+  const key = /^[0-9]+$/.test(value) ? 'id' : 'bundleId';
+  const params = new URLSearchParams({ [key]: value, country });
   return apiGet<Software | null>(`/api/lookup?${params}`);
 }

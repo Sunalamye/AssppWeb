@@ -469,7 +469,8 @@
       "deviceVerificationFailed": "Apple 無法驗證這部裝置。請到帳號頁重新認證，再取得授權。",
       "termsRequiredOnDevice": "Apple 要求接受 App Store 條款。請使用同一個 Apple 帳號開啟 App Store，完成條款確認後再試。",
       "httpFailure": "Apple 購買請求失敗（HTTP {{status}}）。",
-      "invalidResponse": "無法判讀 Apple 的購買回應（HTTP {{status}}）。"
+      "invalidResponse": "無法判讀 Apple 的購買回應（HTTP {{status}}）。",
+      "regionUnavailable": "Apple 回報此 App 在目前國家或地區不可用。請確認 Apple 帳號的商店地區、伺服器連線所在地，以及同一帳號在官方 App Store 的可用性。"
     },
     "auth": {
       "requiresVerification": "驗證需要雙重認證代碼。如果沒有彈出驗證碼，請嘗試在 https://account.apple.com 登入以觸發提示，然後在雙重認證代碼欄位中填寫該代碼。",
@@ -506,6 +507,7 @@
     "msgFailed": "{{appName}}\n{{userName}} / {{appleId}} - {{country}}\n\n錯誤: {{error}}",
     "downloadLimit": {
       "message": "{{appName}}\n應用程式大小 {{size}} MB 超過伺服器限制 {{limit}} MB。\n請聯絡管理員或自行部署後再嘗試。"
-    }
+    },
+    "unknownStorefront": "未知商店地區"
   }
 }

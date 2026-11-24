@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import PageContainer from '../Layout/PageContainer';
 import AppIcon from '../common/AppIcon';
@@ -32,6 +32,17 @@ export default function AddDownload() {
   const [selectedVersion, setSelectedVersion] = useState('');
   const [step, setStep] = useState<'lookup' | 'ready' | 'versions'>('lookup');
   const [loadingAction, setLoadingAction] = useState<'lookup' | 'license' | 'versions' | 'download' | null>(null);
+  const lookupGeneration = useRef(0);
+  const activeLookup = useRef<number | null>(null);
+  const mounted = useRef(true);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      lookupGeneration.current++;
+    };
+  }, []);
 
   const isLoading = loadingAction !== null;
 
@@ -57,14 +68,35 @@ export default function AddDownload() {
     }
   }, [filteredAccounts, selectedAccount]);
 
-  const account = accounts.find((a) => a.email === selectedAccount);
+  const account = filteredAccounts.find((a) => a.email === selectedAccount);
   const autoCountry = firstAccountCountry(accounts);
+
+  function clearLookupResult() {
+    setApp(null);
+    setVersions([]);
+    setSelectedVersion('');
+    setStep('lookup');
+  }
+
+  function changeCountry(nextCountry: string) {
+    if (nextCountry === country) return;
+    lookupGeneration.current++;
+    setCountry(nextCountry);
+    clearLookupResult();
+    // A lookup is read-only. Release its UI guard now, but let its own generation
+    // prevent the eventual completion from changing a newer action's state.
+    if (activeLookup.current !== null) {
+      activeLookup.current = null;
+      actionGuard.end();
+      setLoadingAction(null);
+    }
+  }
 
   useEffect(() => {
     if (countryTouched) return;
     const nextCountry = autoCountry ?? defaultCountry;
     if (nextCountry && nextCountry !== country) {
-      setCountry(nextCountry);
+      changeCountry(nextCountry);
     }
   }, [autoCountry, country, countryTouched, defaultCountry]);
 
@@ -72,11 +104,18 @@ export default function AddDownload() {
     e.preventDefault();
     if (!bundleId.trim()) return;
     if (!actionGuard.begin('download')) return;
+    const generation = ++lookupGeneration.current;
+    activeLookup.current = generation;
     const flow = createDiagnosticFlow('download');
     flow.log('version_lookup', 'start', { endpoint: 'public_version' });
+    clearLookupResult();
     setLoadingAction('lookup');
     try {
       const result = await lookupApp(bundleId.trim(), country);
+      if (!mounted.current || generation !== lookupGeneration.current) {
+        flow.log('version_lookup', 'cancelled', { reason: 'cancelled' });
+        return;
+      }
       if (!result) {
         flow.log('version_lookup', 'failure', { reason: 'not_found' });
         addToast(t('downloads.add.notFound'), 'error');
@@ -88,11 +127,18 @@ export default function AddDownload() {
       setStep('ready');
       flow.log('version_lookup', 'success');
     } catch (e) {
+      if (!mounted.current || generation !== lookupGeneration.current) {
+        flow.log('version_lookup', 'cancelled', { reason: 'cancelled' });
+        return;
+      }
       flow.log('version_lookup', 'failure', errorDiagnosticDetails(e));
       addToast(getErrorMessage(attachDiagnosticId(e, flow.id), t('downloads.add.lookupFailed')), 'error');
     } finally {
-      actionGuard.end();
-      setLoadingAction(null);
+      if (activeLookup.current === generation) {
+        activeLookup.current = null;
+        actionGuard.end();
+        if (mounted.current) setLoadingAction(null);
+      }
     }
   }
 
@@ -113,12 +159,15 @@ export default function AddDownload() {
   async function handleLoadVersions() {
     if (!account || !app) return;
     if (!actionGuard.begin('versions')) return;
+    const generation = lookupGeneration.current;
     setLoadingAction('versions');
     try {
       const result = await loadVersions(account, app);
+      if (!mounted.current || generation !== lookupGeneration.current) return;
       setVersions(result.versions);
       setStep('versions');
     } catch (e) {
+      if (!mounted.current || generation !== lookupGeneration.current) return;
       addToast(getErrorMessage(e, t('downloads.add.versionsFailed')), 'error');
     } finally {
       actionGuard.end();
@@ -173,12 +222,12 @@ export default function AddDownload() {
             <CountrySelect
               value={country}
               onChange={(v) => {
-                setCountry(v);
+                changeCountry(v);
                 setCountryTouched(true);
               }}
               availableCountryCodes={availableCountryCodes}
               allCountryCodes={allCountryCodes}
-              disabled={isLoading}
+              disabled={isLoading && loadingAction !== 'lookup'}
               className="min-h-11 w-full min-w-0 max-w-full truncate disabled:cursor-not-allowed disabled:bg-gray-50 disabled:text-gray-500 dark:disabled:bg-gray-800/50 dark:disabled:text-gray-400"
             />
             <select

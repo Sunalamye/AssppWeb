@@ -469,7 +469,8 @@
       "deviceVerificationFailed": "Apple 无法验证这台设备。请到账户页重新认证，再获取授权。",
       "termsRequiredOnDevice": "Apple 要求接受 App Store 条款。请使用同一个 Apple 账户打开 App Store，完成条款确认后重试。",
       "httpFailure": "Apple 购买请求失败（HTTP {{status}}）。",
-      "invalidResponse": "无法解析 Apple 的购买响应（HTTP {{status}}）。"
+      "invalidResponse": "无法解析 Apple 的购买响应（HTTP {{status}}）。",
+      "regionUnavailable": "Apple 提示此 App 在当前国家或地区不可用。请确认 Apple 账户的商店地区、服务器连接所在地，以及同一账户在官方 App Store 的可用性。"
     },
     "auth": {
       "requiresVerification": "验证需要双重认证代码。如果没有弹出验证码，请尝试在 https://account.apple.com 登录以触发提示，然后在双重认证代码字段中填写该代码。",
@@ -506,6 +507,7 @@
     "msgFailed": "{{appName}}\n{{userName}} / {{appleId}} - {{country}}\n\n错误: {{error}}",
     "downloadLimit": {
       "message": "{{appName}}\n应用大小 {{size}} MB 超过服务器限制 {{limit}} MB。\n请联系管理员或自行部署后再尝试。"
-    }
+    },
+    "unknownStorefront": "未知商店地区"
   }
 }

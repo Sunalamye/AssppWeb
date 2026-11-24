@@ -11,8 +11,11 @@ import { apiPost, apiGet } from '../api/client';
 import { accountHash } from '../utils/account';
 import { getErrorMessage } from '../utils/error';
 import { getAccountContext } from '../utils/toast';
+import { licenseStorefrontForError, rememberLicenseStorefront } from '../utils/licenseContext';
+import { publicStorefrontId } from '../utils/storefront';
 import { missingAccount, withAccountAction } from '../utils/accountActions';
 import { attachDiagnosticId, createDiagnosticFlow, errorDiagnosticDetails } from '../utils/diagnostics';
+import { storeIdToCountry } from '../apple/config';
 import type { DiagnosticFlow } from '../utils/diagnostics';
 import type { Account, Software } from '../types';
 
@@ -115,12 +118,14 @@ export function useDownloadAction() {
   }
 
   async function acquireLicense(account: Account, app: Software) {
+    let storefrontId: string | undefined;
+    let purchasing = false;
     return runForAccount('license', account, async (current, flow) => {
+      storefrontId = publicStorefrontId(current.storeFront || current.store);
       if ((app.price ?? 0) > 0) {
         flow.log('purchase', 'blocked', { reason: 'paid_app' });
         throw new PurchaseError(t('errors.purchase.paidNotSupported'));
       }
-      const ctx = getAccountContext(current, t);
       flow.log('account_refresh', 'start');
       let renewed: Account;
       try {
@@ -135,6 +140,7 @@ export function useDownloadAction() {
           flow,
           current,
         );
+        storefrontId = publicStorefrontId(renewed.storeFront || renewed.store);
         flow.log('account_refresh', 'success');
       } catch (error) {
         flow.log('account_refresh', 'failure', errorDiagnosticDetails(error));
@@ -144,13 +150,20 @@ export function useDownloadAction() {
         throw error;
       }
       await updateAccount(renewed, flow);
+      purchasing = true;
       const result = await purchaseApp(renewed, app, flow);
+      purchasing = false;
       await updateAccount({ ...renewed, cookies: result.updatedCookies }, flow);
       addToast(
-        t('toast.msg', { appName: app.name, ...ctx }),
+        t('toast.msg', { appName: app.name, ...getAccountContext(renewed, t) }),
         'success',
         result.alreadyOwned ? t('toast.title.licenseOwned') : t('toast.title.licenseSuccess'),
       );
+    }).catch((error: unknown) => {
+      // Purchase diagnostics know the actual outbound header; other failures
+      // retain the account snapshot reached by this operation, even if saving failed.
+      const requestedStorefrontId = purchasing ? errorDiagnosticDetails(error).storefrontId : undefined;
+      throw rememberLicenseStorefront(error, requestedStorefrontId ?? storefrontId);
     });
   }
 
@@ -185,10 +198,16 @@ export function useDownloadAction() {
 
   function toastLicenseError(account: Account, app: Software, error: unknown) {
     const ctx = getAccountContext(account, t);
+    const storefrontId = licenseStorefrontForError(error);
+    const countryCode = storefrontId && storeIdToCountry(storefrontId);
+    const country = countryCode
+      ? `${t(`countries.${countryCode}`, countryCode)} (${storefrontId})`
+      : t('toast.unknownStorefront', { defaultValue: 'Unknown' });
     addToast(
       t('toast.msgFailed', {
         appName: app.name,
         ...ctx,
+        country,
         error: getErrorMessage(error, t('toast.title.licenseFailed')),
       }),
       'error',

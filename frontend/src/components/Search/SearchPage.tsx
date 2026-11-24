@@ -18,7 +18,7 @@ export default function SearchPage() {
   const initialCountry = firstAccountCountry(accounts) ?? defaultCountry;
   const addToast = useToastStore((s) => s.addToast);
 
-  const { term, country, entity, results, loading, error, search, setSearchParam } = useSearch();
+  const { term, country, entity, results, resultsCountry, loading, error, search, setSearchParam } = useSearch();
 
   useEffect(() => {
     if (error) {
@@ -114,14 +114,14 @@ export default function SearchPage() {
         </div>
       )}
 
-      {results.length > 0 && (
+      {results.length > 0 && resultsCountry === activeCountry && (
         <div className="overflow-hidden rounded-3xl bg-white shadow-sm ring-1 ring-black/5 dark:bg-gray-900 dark:ring-white/10">
           <div className="divide-y divide-gray-100 dark:divide-gray-800">
             {results.map((app) => (
               <Link
                 key={app.id}
                 to={`/search/${app.id}`}
-                state={{ app, country: activeCountry }}
+                state={{ app, country: resultsCountry }}
                 className="flex items-center gap-4 p-4 transition-colors hover:bg-gray-50 active:bg-gray-100 dark:hover:bg-gray-800/70 dark:active:bg-gray-800"
               >
                 <AppIcon url={app.artworkUrl} name={app.name} size="md" />

@@ -469,7 +469,8 @@
       "deviceVerificationFailed": "Apple could not verify this device. Re-authenticate on the account page before acquiring the license.",
       "termsRequiredOnDevice": "Apple requires acceptance of the App Store terms. Open the App Store with this same Apple account, review and accept the terms, then retry.",
       "httpFailure": "The Apple purchase request failed (HTTP {{status}}).",
-      "invalidResponse": "The Apple purchase response could not be read (HTTP {{status}})."
+      "invalidResponse": "The Apple purchase response could not be read (HTTP {{status}}).",
+      "regionUnavailable": "Apple reports that this app is unavailable in the current country or region. Check the Apple Account store region, the server connection location, and availability in the official App Store with the same account."
     },
     "auth": {
       "requiresVerification": "Authentication requires verification code. If no verification code was prompted, try logging in at https://account.apple.com to trigger the alert and fill the code in the 2FA Code field.",
@@ -506,6 +507,7 @@
     "msgFailed": "{{appName}}\n{{userName}} / {{appleId}} - {{country}}\n\nError: {{error}}",
     "downloadLimit": {
       "message": "{{appName}}\nApp size {{size}} MB exceeds the server limit of {{limit}} MB.\nPlease contact the administrator or deploy your own instance."
-    }
+    },
+    "unknownStorefront": "Unknown store region"
   }
 }

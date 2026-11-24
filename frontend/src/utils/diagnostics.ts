@@ -1,4 +1,5 @@
 import { enqueueDiagnosticEvent } from './diagnosticTransport';
+import { validStorefrontId } from './storefront';
 
 export const diagnosticFlows = ['login', 'license', 'download', 'versions', 'account', 'settings'] as const;
 export const diagnosticStages = [
@@ -82,6 +83,7 @@ export const diagnosticReasons = [
   'subscription_required',
   'license_required',
   'version_mismatch',
+  'region_unavailable',
 ] as const;
 export const diagnosticEndpoints = [
   'native_auth',
@@ -125,6 +127,7 @@ export const diagnosticPurchaseBranches = [
   'device_verification',
   'token_expired',
   'subscription_required',
+  'region_unavailable',
   'dialog_present',
   'action_present',
   'invalid_status',
@@ -148,6 +151,13 @@ export const diagnosticDialogKinds = [
   'other',
 ] as const;
 export const diagnosticActionKinds = ['missing', 'Goto', 'Buy', 'Download', 'SignIn', 'other'] as const;
+export const diagnosticStorefrontSources = ['apple_assigned', 'saved_account', 'request_echo', 'unset'] as const;
+export const diagnosticStorefrontFields = [
+  'storefrontId',
+  'savedStorefrontId',
+  'assignedStorefrontId',
+  'requestedStorefrontId',
+] as const;
 
 /** Syntax for Apple protocol identifiers only; never pass arbitrary messages here. */
 export function validAppleDialogCode(value: unknown): value is string {
@@ -184,6 +194,12 @@ export interface DiagnosticDetails {
   messagePresent?: boolean;
   dialogKind?: (typeof diagnosticDialogKinds)[number];
   actionKind?: (typeof diagnosticActionKinds)[number];
+  storefrontId?: string;
+  savedStorefrontId?: string;
+  assignedStorefrontId?: string;
+  requestedStorefrontId?: string;
+  storefrontSource?: (typeof diagnosticStorefrontSources)[number];
+  catalogAppId?: number;
   action?: 'RP' | 'SP';
   responseType?: 'purchaseSuccess' | 'buyProductFailure' | 'other' | 'missing';
   dialog?:
@@ -253,6 +269,17 @@ export function safeDiagnosticDetails(details: DiagnosticDetails): DiagnosticDet
   if (included(diagnosticStatusKinds, details.statusKind)) safe.statusKind = details.statusKind;
   if (included(diagnosticDialogKinds, details.dialogKind)) safe.dialogKind = details.dialogKind;
   if (included(diagnosticActionKinds, details.actionKind)) safe.actionKind = details.actionKind;
+  if (included(diagnosticStorefrontSources, details.storefrontSource)) safe.storefrontSource = details.storefrontSource;
+  for (const key of diagnosticStorefrontFields) {
+    if (validStorefrontId(details[key])) safe[key] = details[key];
+  }
+  if (
+    Number.isSafeInteger(details.catalogAppId) &&
+    details.catalogAppId! > 0 &&
+    details.catalogAppId! <= 9_999_999_999
+  ) {
+    safe.catalogAppId = details.catalogAppId;
+  }
   for (const key of [
     'alreadyOwned',
     'codeRequired',
