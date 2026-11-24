@@ -96,6 +96,8 @@ Cross-tab account coordination requires Web Locks; browsers without that API ret
 
 ## Verification commands
 
+Workers Builds success means that the Worker deployment and container rollout were submitted. Before calling a release complete, compare the live container image with the image built for that commit, send a safe diagnostic event, and query its `flowId` in the Containers dataset. Include `/api/store-proof/health` in the same flow to verify the browser, backend, and helper correlation headers. A Worker version at 100% traffic alone does not prove the container already runs the new image. See [Cloudflare's rollout lifecycle](https://developers.cloudflare.com/containers/configuration/rollouts/).
+
 ```bash
 npm --prefix frontend test
 npm --prefix frontend run build

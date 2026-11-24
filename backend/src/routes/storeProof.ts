@@ -164,6 +164,10 @@ router.get('/store-proof/health', async (req, res) => {
   res.set('Cache-Control', 'no-store');
   try {
     const response = await fetch(`${helperURL}/health`, {
+      headers: {
+        'X-Asspp-Flow-Id': trace.flowId,
+        'X-Asspp-Request-Id': trace.requestId,
+      },
       signal: AbortSignal.timeout(5_000),
       redirect: 'error',
     });

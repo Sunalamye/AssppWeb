@@ -118,11 +118,24 @@ describe('device proof HTTP boundary', () => {
     expect(unavailable.text).not.toContain('secret-state');
   });
 
-  it('returns only readiness from helper health', async () => {
+  it('correlates helper readiness without forwarding credentials or reflecting state', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(Response.json({ status: 'ready', state: 'do-not-reflect' }));
-    const response = await request(app()).get('/api/store-proof/health');
+    const flowId = '34aa2f6d-56d3-4491-a24f-01fc597823c3';
+    const response = await request(app())
+      .get('/api/store-proof/health')
+      .set('X-Asspp-Flow-Id', flowId)
+      .set('Cookie', 'private-cookie');
     expect(response.status).toBe(200);
     expect(response.body).toEqual({ status: 'ready' });
+    expect(response.headers['x-asspp-flow-id']).toBe(flowId);
+    expect(fetch).toHaveBeenCalledExactlyOnceWith('http://127.0.0.1:8081/health', {
+      headers: {
+        'X-Asspp-Flow-Id': flowId,
+        'X-Asspp-Request-Id': response.headers['x-asspp-request-id'],
+      },
+      signal: expect.any(AbortSignal),
+      redirect: 'error',
+    });
   });
 
   it('waits through the initial loopback connection race and preserves explicit preparation failures', async () => {
